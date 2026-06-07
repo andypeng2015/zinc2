@@ -101,6 +101,15 @@ pub const MoeGateUpGegluPushConstants = extern struct {
     y_offset: u32,
 };
 
+/// Push constants for Gemma short-prefill token-batched top-1 MoE shaders.
+pub const GemmaTop1MoeBatchPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    up_or_routing_stride: u32,
+    routing_stride: u32 = 0,
+};
+
 /// Push constants for the fused split-K merge + o_proj DMMV-acc shader
 /// (src/shaders/dmmv_q4k_o_proj_merge.comp). Adds the merge-pass parameters
 /// to the standard DmmvPushConstants so a single dispatch reads partials,
@@ -395,6 +404,8 @@ pub const DmmvDispatch = struct {
     /// routing buffer and writes GEGLU activations for all selected experts
     /// into contiguous activation slabs.
     pipeline_q4k_moe_fused_gate_up_geglu: ?Pipeline,
+    /// Gemma short-prefill token-batched top-1 fused gate+up+GEGLU.
+    pipeline_q4k_moe_fused_gate_up_geglu_batch_top1: ?Pipeline,
     /// Q8_0 sibling of pipeline_q4k_fused_gate_up_swiglu. Targets the
     /// shared expert in Qwen 3.5 / 3.6 MoE packs where shared FFN
     /// weights ship as Q8_0 (rather than Q4_K). Same 4-binding layout
@@ -455,6 +466,8 @@ pub const DmmvDispatch = struct {
     /// ffn_down_exps.scale on-GPU. This lets Gemma use GPU top-k without
     /// CPU-side routing weight patch-up.
     pipeline_q5_1_moe_fused_down_acc_scaled: ?Pipeline,
+    /// Gemma short-prefill token-batched top-1 Q5_1 down + scaled accumulate.
+    pipeline_q5_1_moe_down_acc_scaled_batch_top1: ?Pipeline,
     /// Q8_0 sibling of pipeline_q5_1_moe_fused_down_acc_scaled for Gemma
     /// layers whose down experts are stored as Q8_0.
     pipeline_q8_0_moe_fused_down_acc_scaled: ?Pipeline,
@@ -858,6 +871,12 @@ pub const DmmvDispatch = struct {
             log.warn("Q4_K Gemma MoE fused gate+up+GEGLU shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const q4k_moe_fused_gate_up_geglu_batch_top1_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_fused_gate_up_geglu_batch_top1.spv", .{shader_dir}) catch unreachable;
+        const gemma_top1_batch_push_size = @sizeOf(GemmaTop1MoeBatchPushConstants);
+        const pipeline_q4k_moe_fused_gate_up_geglu_batch_top1 = pipeline_mod.createFromSpirvWithOptions(instance, q4k_moe_fused_gate_up_geglu_batch_top1_path, 4, gemma_top1_batch_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K Gemma top-1 batched gate+up+GEGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
         // Q8_0 fused gate+up+SwiGLU. 4 bindings, same push struct as the
         // Q4_K variant. Used by the shared expert path on Qwen 3.5 / 3.6
@@ -925,6 +944,11 @@ pub const DmmvDispatch = struct {
         const q5_1_fused_down_acc_scaled_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1_moe_fused_down_acc_scaled.spv", .{shader_dir}) catch unreachable;
         const pipeline_q5_1_moe_fused_down_acc_scaled = pipeline_mod.createFromSpirvWithOptions(instance, q5_1_fused_down_acc_scaled_path, 5, fused_down_acc_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q5_1 Gemma MoE scaled fused down+acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q5_1_down_acc_scaled_batch_top1_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1_moe_down_acc_scaled_batch_top1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5_1_moe_down_acc_scaled_batch_top1 = pipeline_mod.createFromSpirvWithOptions(instance, q5_1_down_acc_scaled_batch_top1_path, 5, gemma_top1_batch_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_1 Gemma top-1 batched scaled down+acc shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
         const q8_0_fused_down_acc_scaled_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_moe_fused_down_acc_scaled.spv", .{shader_dir}) catch unreachable;
@@ -1266,6 +1290,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q4k_fused_gate_up_geglu = pipeline_q4k_fused_gate_up_geglu,
             .pipeline_q4k_fused_gate_up_geglu_pair = pipeline_q4k_fused_gate_up_geglu_pair,
             .pipeline_q4k_moe_fused_gate_up_geglu = pipeline_q4k_moe_fused_gate_up_geglu,
+            .pipeline_q4k_moe_fused_gate_up_geglu_batch_top1 = pipeline_q4k_moe_fused_gate_up_geglu_batch_top1,
             .pipeline_q8_0_fused_gate_up_swiglu = pipeline_q8_0_fused_gate_up_swiglu,
             .pipeline_q8_0_fused_gate_up_swiglu_gate = pipeline_q8_0_fused_gate_up_swiglu_gate,
             .pipeline_q8_0_sigmoid_acc = pipeline_q8_0_sigmoid_acc,
@@ -1277,6 +1302,7 @@ pub const DmmvDispatch = struct {
             .pipeline_q5_1_acc = pipeline_q5_1_acc,
             .pipeline_q5_1_moe_fused_down_acc = pipeline_q5_1_moe_fused_down_acc,
             .pipeline_q5_1_moe_fused_down_acc_scaled = pipeline_q5_1_moe_fused_down_acc_scaled,
+            .pipeline_q5_1_moe_down_acc_scaled_batch_top1 = pipeline_q5_1_moe_down_acc_scaled_batch_top1,
             .pipeline_q8_0_moe_fused_down_acc_scaled = pipeline_q8_0_moe_fused_down_acc_scaled,
             .pipeline_q5k_moe = pipeline_q5k_moe,
             .pipeline_q5k_moe_kpar = pipeline_q5k_moe_kpar,
@@ -2831,6 +2857,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q4k_fused_gate_up_geglu) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_geglu_pair) |*p| p.deinit();
         if (self.pipeline_q4k_moe_fused_gate_up_geglu) |*p| p.deinit();
+        if (self.pipeline_q4k_moe_fused_gate_up_geglu_batch_top1) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu) |*p| p.deinit();
         if (self.pipeline_q8_0_fused_gate_up_swiglu_gate) |*p| p.deinit();
         if (self.pipeline_q8_0_sigmoid_acc) |*p| p.deinit();
@@ -2843,6 +2870,7 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q5_1_acc) |*p| p.deinit();
         if (self.pipeline_q5_1_moe_fused_down_acc) |*p| p.deinit();
         if (self.pipeline_q5_1_moe_fused_down_acc_scaled) |*p| p.deinit();
+        if (self.pipeline_q5_1_moe_down_acc_scaled_batch_top1) |*p| p.deinit();
         if (self.pipeline_q8_0_moe_fused_down_acc_scaled) |*p| p.deinit();
         if (self.pipeline_q6k_moe) |*p| p.deinit();
         if (self.pipeline_quantize_q8_1) |*p| p.deinit();
