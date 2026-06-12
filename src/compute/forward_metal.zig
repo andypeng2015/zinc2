@@ -777,6 +777,9 @@ const DmmvDetailClass = enum(u8) {
     ssm_gate,
     ssm_tail,
     ssm_out,
+    dense_gate,
+    dense_up,
+    dense_down,
     shared_gate_up,
     shared_down,
     moe_gate_up,
@@ -1079,6 +1082,9 @@ pub const RuntimeProfile = struct {
     shared_expert_gate_up_bytes: u64 = 0,
     shared_expert_down_bytes: u64 = 0,
     dense_ffn_bytes: u64 = 0,
+    dense_ffn_gate_bytes: u64 = 0,
+    dense_ffn_up_bytes: u64 = 0,
+    dense_ffn_down_bytes: u64 = 0,
     moe_expert_bytes: u64 = 0,
     moe_expert_gate_up_bytes: u64 = 0,
     moe_expert_down_bytes: u64 = 0,
@@ -1628,6 +1634,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.shared_expert_gate_up_bytes = total.shared_expert_gate_up_bytes -| prefix.shared_expert_gate_up_bytes;
     delta.shared_expert_down_bytes = total.shared_expert_down_bytes -| prefix.shared_expert_down_bytes;
     delta.dense_ffn_bytes = total.dense_ffn_bytes -| prefix.dense_ffn_bytes;
+    delta.dense_ffn_gate_bytes = total.dense_ffn_gate_bytes -| prefix.dense_ffn_gate_bytes;
+    delta.dense_ffn_up_bytes = total.dense_ffn_up_bytes -| prefix.dense_ffn_up_bytes;
+    delta.dense_ffn_down_bytes = total.dense_ffn_down_bytes -| prefix.dense_ffn_down_bytes;
     delta.moe_expert_bytes = total.moe_expert_bytes -| prefix.moe_expert_bytes;
     delta.moe_expert_gate_up_bytes = total.moe_expert_gate_up_bytes -| prefix.moe_expert_gate_up_bytes;
     delta.moe_expert_down_bytes = total.moe_expert_down_bytes -| prefix.moe_expert_down_bytes;
@@ -1708,6 +1717,13 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         bytesToGiB(profile.router_bytes),
         profile.router_topk_calls,
         nsToMs(profile.router_cpu_ns),
+    });
+    log.info("  {s} buckets: dense ffn total {d:.2} GiB gate {d:.2} GiB up {d:.2} GiB down {d:.2} GiB", .{
+        label,
+        bytesToGiB(profile.dense_ffn_bytes),
+        bytesToGiB(profile.dense_ffn_gate_bytes),
+        bytesToGiB(profile.dense_ffn_up_bytes),
+        bytesToGiB(profile.dense_ffn_down_bytes),
     });
     log.info("  {s} buckets: moe gate/up {d:.2} GiB down {d:.2} GiB | shared gate/up {d:.2} GiB down {d:.2} GiB | waits {d} commits {d:.2} ms", .{
         label,
@@ -8816,6 +8832,14 @@ fn classifyDmmvDetailUncached(path: DmmvPathClass, name: []const u8) DmmvDetailC
             .ssm_tail
         else
             .none,
+        .dense_ffn => if (std.mem.endsWith(u8, name, "ffn_gate.weight"))
+            .dense_gate
+        else if (std.mem.endsWith(u8, name, "ffn_up.weight"))
+            .dense_up
+        else if (std.mem.endsWith(u8, name, "ffn_down.weight"))
+            .dense_down
+        else
+            .none,
         .shared_expert => if (isSharedDownTensor(name) or std.mem.endsWith(u8, name, "ffn_down.weight"))
             .shared_down
         else if (isSharedGateUpTensor(name) or
@@ -8861,6 +8885,9 @@ fn recordDetailedDmmvBytes(profile: *RuntimeProfile, detail: DmmvDetailClass, by
             profile.ssm_tail_projection_bytes += bytes;
         },
         .ssm_out => profile.ssm_out_bytes += bytes,
+        .dense_gate => profile.dense_ffn_gate_bytes += bytes,
+        .dense_up => profile.dense_ffn_up_bytes += bytes,
+        .dense_down => profile.dense_ffn_down_bytes += bytes,
         .shared_gate_up => profile.shared_expert_gate_up_bytes += bytes,
         .shared_down => profile.shared_expert_down_bytes += bytes,
         .moe_gate_up => profile.moe_expert_gate_up_bytes += bytes,
@@ -29731,7 +29758,13 @@ test "gemma dense-named shared experts populate detailed profile buckets" {
     try std.testing.expectEqual(DmmvDetailClass.shared_gate_up, classifyDmmvDetailUncached(.shared_expert, "blk.0.ffn_up.weight"));
     try std.testing.expectEqual(DmmvDetailClass.shared_down, classifyDmmvDetailUncached(.shared_expert, "blk.0.ffn_down.weight"));
     try std.testing.expectEqual(DmmvDetailClass.shared_gate_up, classifyDmmvDetailUncached(.shared_expert, "blk.0.ffn_gate_shexp.weight"));
-    try std.testing.expectEqual(DmmvDetailClass.none, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_gate.weight"));
+}
+
+test "dense FFN tensors populate detailed profile buckets" {
+    try std.testing.expectEqual(DmmvDetailClass.dense_gate, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_gate.weight"));
+    try std.testing.expectEqual(DmmvDetailClass.dense_up, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_up.weight"));
+    try std.testing.expectEqual(DmmvDetailClass.dense_down, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_down.weight"));
+    try std.testing.expectEqual(DmmvDetailClass.none, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_gate_shexp.weight"));
 }
 
 test "q8 lm head stays on GPU" {
