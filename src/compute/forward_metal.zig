@@ -3151,6 +3151,12 @@ fn usesGeglu(cfg: ModelConfig) bool {
     return cfg.architecture == .gemma;
 }
 
+fn supportsDenseQ4KGateUpSwiGLUArchitecture(cfg: ModelConfig) bool {
+    return (cfg.architecture == .qwen2 or cfg.architecture == .qwen35) and
+        cfg.n_experts == 0 and
+        !usesGeglu(cfg);
+}
+
 fn hasExplicitGemmaMoeTensors(cfg: ModelConfig, lt: LayerTensors) bool {
     return cfg.architecture == .gemma and lt.ffn_gate_up_exps != null and
         (lt.ffn_gate_inp_scale != null or
@@ -9974,18 +9980,17 @@ fn canUseDenseQ4KGateUpSwiGLU(
     M: u32,
     K: u32,
 ) bool {
-    // Sibling of canUseDenseQ4KGateUpGeGLU but for SwiGLU architectures
-    // (Qwen3 dense — `.qwen2` enum covers Qwen3 8B, Mistral/Llama also use
-    // SwiGLU but are not yet validated through this path). Drops 2
-    // dispatches + 1 barrier per dense FFN layer and avoids the DRAM
+    // Sibling of canUseDenseQ4KGateUpGeGLU but for dense Qwen SwiGLU models.
+    // The target Qwen3.6 27B hybrid loads as `.qwen35`, has no MoE experts,
+    // and hits the same Q4_K gate/up shape as the existing dense Qwen path.
+    // Drops 2 dispatches + 1 barrier per dense FFN layer and avoids the DRAM
     // round trip for the inter_dim-wide gate/up intermediates.
     return !engine.debug_validation_enabled and
-        engine.config.architecture == .qwen2 and
-        engine.config.n_experts == 0 and
-        !usesGeglu(engine.config) and
+        supportsDenseQ4KGateUpSwiGLUArchitecture(engine.config) and
         gate.info.type_ == .q4_k and
         up.info.type_ == .q4_k and
         M > 0 and
+        (M % 4) == 0 and
         K > 0 and
         K % 256 == 0 and
         engine.dmmv_q4k_dense_gate_up_swiglu_pipe.handle != null and
@@ -29779,6 +29784,41 @@ test "dense FFN tensors populate detailed profile buckets" {
     try std.testing.expectEqual(DmmvDetailClass.dense_up, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_up.weight"));
     try std.testing.expectEqual(DmmvDetailClass.dense_down, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_down.weight"));
     try std.testing.expectEqual(DmmvDetailClass.none, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_gate_shexp.weight"));
+}
+
+test "dense qwen35 can use q4k gate up swiglu fusion" {
+    var cfg = ModelConfig{
+        .architecture = .qwen35,
+        .n_layers = 64,
+        .n_heads = 24,
+        .n_kv_heads = 4,
+        .head_dim = 256,
+        .hidden_dim = 5120,
+        .intermediate_dim = 17408,
+        .vocab_size = 248320,
+        .context_length = 0,
+        .rope_freq_base = 1_000_000.0,
+        .n_experts = 0,
+        .n_experts_used = 0,
+        .rope_dim = 64,
+        .ssm_d_conv = 4,
+        .ssm_d_inner = 6144,
+        .ssm_d_state = 128,
+        .ssm_dt_rank = 48,
+        .ssm_n_group = 16,
+        .full_attn_interval = 4,
+        .shared_expert_intermediate_dim = 0,
+    };
+
+    try std.testing.expect(supportsDenseQ4KGateUpSwiGLUArchitecture(cfg));
+    cfg.architecture = .qwen2;
+    try std.testing.expect(supportsDenseQ4KGateUpSwiGLUArchitecture(cfg));
+    cfg.architecture = .qwen2_moe;
+    cfg.n_experts = 256;
+    try std.testing.expect(!supportsDenseQ4KGateUpSwiGLUArchitecture(cfg));
+    cfg.architecture = .gemma;
+    cfg.n_experts = 0;
+    try std.testing.expect(!supportsDenseQ4KGateUpSwiGLUArchitecture(cfg));
 }
 
 test "q8 lm head stays on GPU" {
