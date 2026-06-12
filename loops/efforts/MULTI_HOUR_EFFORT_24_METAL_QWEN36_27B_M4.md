@@ -133,7 +133,7 @@ hybrid path streams dense FFN weights on every layer.
 
 ## Current checkpoint
 
-Updated after local M4 run `.metal_optimize/2026-06-12T22-31-20`:
+Updated after local M4 run `.metal_optimize/2026-06-12T22-31-20` cycles 1-6:
 
 - Baseline locked at `10.48 decode tok/s` on the effort prompt.
 - Cycle 1 kept profile enablement for dense FFN gate/up/down byte buckets.
@@ -144,6 +144,19 @@ Updated after local M4 run `.metal_optimize/2026-06-12T22-31-20`:
   restored the promoted-best cycle-2 tree. Do not retry this guard flip unless
   a same-cycle A/B explains why fewer barriers lost throughput and gives a
   different fix.
+- Cycle 4 kept the major win: route Qwen3.6 27B exact dense Q6_K down
+  projection `M=5120 K=17408` to the optimized llama-style Metal DMMV path.
+  Median moved to `12.56 decode tok/s` (`+2.06 tok/s`, about `+19.6%`).
+- Cycle 5 tried routing the exact dense Q4_K gate/up pair to the existing
+  non-SwiGLU dual projection kernel. It regressed to `11.07 tok/s` and was
+  reverted. Do not retry that route without shader-level evidence explaining
+  the loss.
+- Cycle 6 kept a neutral fixed-`K=17408` Q6_K pipeline specialization for the
+  same dense-down shape. It measured `12.56 tok/s`, so treat it as cleanup /
+  enablement around the proven cycle-4 route, not as a separate speed win.
+- Cross-effort prefill improved from `11.60` to `14.20 tok/s` after the Q6_K
+  dense-down work (`+22.4%`), so keep this route while watching long prompt
+  correctness.
 
 Cycle-2 promoted-best profile:
 
@@ -160,10 +173,12 @@ barriers/step: attn 128.0 ssm 288.0 dense 256.0 final 0.3
 
 Best next directions from this checkpoint:
 
-1. Treat Q6_K dense down `M=5120 K=17408` as the next exact-shape target.
+1. Continue from the Q6_K dense-down route, but do not repeat the generic
+   route-expansion work. The accepted route is already exact to 27B
+   `ffn_down.weight`.
 2. Treat Q4_K dense gate/up `M=17408 K=5120` as hot, but do not re-enable the
-   existing `.qwen35` fused gate/up+SwiGLU path without explaining the cycle-3
-   slowdown.
+   existing `.qwen35` fused gate/up+SwiGLU path or the non-SwiGLU dual route
+   without explaining the cycle-3/cycle-5 slowdowns.
 3. SSM projection is the next non-dense bucket; profile any SSM change against
    the dense down target so the loop does not drift.
 4. LM head is visible but smaller than dense down. Do not chase it before the
