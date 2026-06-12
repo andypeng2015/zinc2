@@ -131,6 +131,44 @@ Do not optimize from Qwen 3.6 35B-A3B's `82 tok/s` decode result. That model
 is routed MoE and has very different per-token weight traffic. The 27B dense
 hybrid path streams dense FFN weights on every layer.
 
+## Current checkpoint
+
+Updated after local M4 run `.metal_optimize/2026-06-12T22-31-20`:
+
+- Baseline locked at `10.48 decode tok/s` on the effort prompt.
+- Cycle 1 kept profile enablement for dense FFN gate/up/down byte buckets.
+- Cycle 2 kept hybrid SSM+dense decode command coalescing at `10.50 tok/s`.
+- Cycle 3 tried enabling the existing fused dense Q4_K gate/up+SwiGLU path for
+  `.qwen35` dense/no-expert models. It reduced dense barriers (`dense
+  barriers/step 256 -> 192`) but measured slower at `10.42 tok/s`; the harness
+  restored the promoted-best cycle-2 tree. Do not retry this guard flip unless
+  a same-cycle A/B explains why fewer barriers lost throughput and gives a
+  different fix.
+
+Cycle-2 promoted-best profile:
+
+```text
+decode buckets: dense ffn total 299.14 GiB gate 92.64 GiB up 92.64 GiB down 113.87 GiB
+decode buckets: ssm proj 77.48 GiB (qkv 50.23 gate 24.52 tail 2.72) out 29.97 GiB
+decode buckets: final 39.25 ms lm-head 30.11 GiB
+decode q4_k hot #1: dense M=17408 K=5120 bytes=185.27 GiB calls=3968
+decode q4_k hot #2: dense M=5120 K=17408 bytes=46.32 GiB calls=992
+decode q6_k hot #1: dense M=5120 K=17408 bytes=67.55 GiB calls=992
+decode q6_k hot #2: lm-head M=248320 K=5120 bytes=30.11 GiB calls=31
+barriers/step: attn 128.0 ssm 288.0 dense 256.0 final 0.3
+```
+
+Best next directions from this checkpoint:
+
+1. Treat Q6_K dense down `M=5120 K=17408` as the next exact-shape target.
+2. Treat Q4_K dense gate/up `M=17408 K=5120` as hot, but do not re-enable the
+   existing `.qwen35` fused gate/up+SwiGLU path without explaining the cycle-3
+   slowdown.
+3. SSM projection is the next non-dense bucket; profile any SSM change against
+   the dense down target so the loop does not drift.
+4. LM head is visible but smaller than dense down. Do not chase it before the
+   dense and SSM buckets unless a profile moves it higher.
+
 ## First-cycle checklist
 
 Before editing:
