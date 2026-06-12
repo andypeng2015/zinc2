@@ -26,6 +26,10 @@ inline float s8_to_f32(uint x) {
 #define BLOCK_SIZE 210
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
+#ifndef ZINC_Q6K_FIXED_BLOCKS
+#define ZINC_Q6K_FIXED_BLOCKS 0
+#endif
+
 kernel void main0(
     device const uchar* W [[buffer(0)]],
     constant DmmvPush& p [[buffer(1)]],
@@ -35,9 +39,14 @@ kernel void main0(
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
+#if ZINC_Q6K_FIXED_BLOCKS
+    constexpr uint nb = ZINC_Q6K_FIXED_BLOCKS;
+    constexpr uint row_bytes = ZINC_Q6K_FIXED_BLOCKS * BLOCK_SIZE;
+#else
     const uint nb = p.K / QK_K;
-    const uint first_row = (tgpig.x * NSG + uint(sgitg)) * NR0;
     const uint row_bytes = nb * BLOCK_SIZE;
+#endif
+    const uint first_row = (tgpig.x * NSG + uint(sgitg)) * NR0;
 
     device const uchar* src0 = W + p.a_offset;
     device const float* src1 = X + (p.x_offset / 4u);
