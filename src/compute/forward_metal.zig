@@ -257,6 +257,25 @@ fn defaultQ8DualThreadgroup(chip: metal_device.GpuFamily, simd_width: u32, max_t
     return null;
 }
 
+fn supportsDenseQ6kSimdgroupDmmvArch(arch: config_mod.Architecture) bool {
+    return arch == .gemma or arch == .qwen2;
+}
+
+fn isQwen35DenseDownQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        M == cfg.hidden_dim and
+        K == cfg.intermediate_dim and
+        std.mem.endsWith(u8, tensor_name, "ffn_down.weight");
+}
+
+fn canUseDenseQ6kSimdgroupDmmvShape(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    if (cfg.n_experts != 0 or M == 0 or M % 4 != 0 or K % 256 != 0) return false;
+    return supportsDenseQ6kSimdgroupDmmvArch(cfg.architecture) or
+        isQwen35DenseDownQ6kTarget(cfg, tensor_name, M, K);
+}
+
 fn preferApple9Q8K2048Path(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
     if (K > 2048) return false;
 
@@ -8367,10 +8386,7 @@ pub const InferenceEngine = struct {
                 // single-thread-per-row Vulkan port. For dense Q6_K matvec at
                 // K%256==0 (Gemma final norm, Qwen3 lm_head) the llama variant
                 // is strictly better.
-                if ((self.config.architecture == .gemma or self.config.architecture == .qwen2) and
-                    self.config.n_experts == 0 and
-                    M % 4 == 0 and
-                    K % 256 == 0 and
+                if (canUseDenseQ6kSimdgroupDmmvShape(self.config, tensor.info.name, M, K) and
                     self.dmmv_q6k_llama_pipe.handle != null)
                 {
                     break :blk .{ .pipe = &self.dmmv_q6k_llama_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
@@ -11597,12 +11613,8 @@ fn canUseDenseQ6kSimdgroupDmmv(
     // Dense single-token decode should follow llama.cpp's mul_mv Q6_K path.
     // The MoE Q6_K shader stages X in threadgroup memory for routed experts;
     // that does not match this N=1 dense projection shape.
-    return engine.config.architecture == .gemma and
-        engine.config.n_experts == 0 and
+    return canUseDenseQ6kSimdgroupDmmvShape(engine.config, tensor.info.name, M, K) and
         tensor.info.type_ == .q6_k and
-        M > 0 and
-        M % 4 == 0 and
-        K % 256 == 0 and
         engine.dmmv_q6k_llama_pipe.handle != null;
 }
 
@@ -29719,6 +29731,39 @@ test "global q8 override skips gemma shared expert q8 tensors" {
     try std.testing.expect(!shouldUseGlobalQ8Override(.gemma, "blk.0.ffn_gate.weight"));
     try std.testing.expect(shouldUseGlobalQ8Override(.gemma, "blk.0.attn_q.weight"));
     try std.testing.expect(shouldUseGlobalQ8Override(.qwen35, "blk.0.ffn_down.weight"));
+}
+
+test "dense q6k simdgroup route covers qwen35 27b down exact shape" {
+    const qwen35_27b_cfg = ModelConfig{
+        .architecture = .qwen35,
+        .n_layers = 64,
+        .n_heads = 24,
+        .n_kv_heads = 4,
+        .head_dim = 128,
+        .hidden_dim = 5120,
+        .intermediate_dim = 17408,
+        .vocab_size = 248320,
+        .context_length = 32768,
+        .rope_freq_base = 1_000_000.0,
+        .n_experts = 0,
+        .n_experts_used = 0,
+        .rope_dim = 128,
+        .ssm_d_conv = 4,
+        .ssm_d_inner = 6144,
+        .ssm_d_state = 128,
+        .ssm_dt_rank = 48,
+        .ssm_n_group = 16,
+        .full_attn_interval = 4,
+        .shared_expert_intermediate_dim = 0,
+    };
+
+    try std.testing.expect(supportsDenseQ6kSimdgroupDmmvArch(.gemma));
+    try std.testing.expect(supportsDenseQ6kSimdgroupDmmvArch(.qwen2));
+    try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen35));
+    try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen2_moe));
+    try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
+    try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ssm_out.weight", 10240, 5120));
+    try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "output.weight", 248320, 5120));
 }
 
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
