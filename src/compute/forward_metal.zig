@@ -21825,10 +21825,10 @@ fn runDecodeStep(
         .barrier_enabled = false,
     };
     // Sized to hold one token's worth of async layer command buffers. The
-    // use_dense_layer_cmd path submits a few grouped chunks, but the
-    // use_async_local_decode path (hybrid SSM dense decode) submits two per
-    // layer (attn/ssm + FFN), so a 64-layer model (qwen36-27b) needs 128 slots;
-    // 256 keeps a token's commands in flight without a forced mid-token flush.
+    // use_dense_layer_cmd path submits a few grouped chunks, while the hybrid
+    // SSM dense path submits one command per layer. Keep 256 slots so a full
+    // 64-layer token can stay queued even if a future validation/debug path
+    // temporarily splits a layer command.
     var dense_pending_cmds: [256]MetalCommand = undefined;
     var dense_pending_count: usize = 0;
     errdefer waitPendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count, profile);
@@ -21862,6 +21862,13 @@ fn runDecodeStep(
         // standalone scale_in_place dispatch + barrier at the layer tail can
         // then be skipped (≈60 dispatches/60 barriers per token on Gemma 31B).
         var layer_output_scale_fused_into_post_norm: bool = false;
+        var hybrid_layer_cmd_storage = MetalCommand{
+            .handle = null,
+            .dispatch_count = 0,
+            .barrier_count = 0,
+            .barrier_enabled = false,
+        };
+        const use_hybrid_layer_cmd = use_async_local_decode and shared_cmd == null and !use_dense_layer_cmd;
         const layer_shared_cmd: ?*MetalCommand = if (shared_cmd) |cmd|
             cmd
         else if (use_dense_layer_cmd) blk: {
@@ -21869,6 +21876,9 @@ fn runDecodeStep(
                 dense_group_cmd_storage = try beginProfiledCommand(engine, profile);
             }
             break :blk &dense_group_cmd_storage;
+        } else if (use_hybrid_layer_cmd) blk: {
+            hybrid_layer_cmd_storage = try beginProfiledCommand(engine, profile);
+            break :blk &hybrid_layer_cmd_storage;
         } else null;
 
         if (is_full_attn) {
@@ -23577,10 +23587,11 @@ fn runDecodeStep(
                     layer_shared_cmd != null and
                     shared_cmd == null and
                     next_layer_idx_u == layer_count;
-                const ends_dense_cmd_chunk = use_dense_layer_cmd and
-                    layer_shared_cmd != null and
-                    (next_layer_idx_u == layer_count or next_layer_idx_u % dense_cmd_group_layers == 0) and
-                    !keep_terminal_dense_cmd_for_final;
+                const ends_dense_cmd_chunk = layer_shared_cmd != null and
+                    ((use_dense_layer_cmd and
+                        (next_layer_idx_u == layer_count or next_layer_idx_u % dense_cmd_group_layers == 0) and
+                        !keep_terminal_dense_cmd_for_final) or
+                        use_hybrid_layer_cmd);
                 const layer_output_scale_folded_pre = skip_pre_ffn_router and !engine.debug_validation_enabled;
                 // The fused kernel now folds an arbitrary `hidden_scale` into
                 // its in-place hidden write, so a non-unit `layer_output_scale`
@@ -23746,6 +23757,9 @@ fn runDecodeStep(
 
         if (engine.debug_validation_enabled and engine.position == 0) {
             logLayerDiagnostics(engine, lt, layer, is_full_attn, "post_ffn");
+        }
+        if (use_hybrid_layer_cmd and hybrid_layer_cmd_storage.handle != null) {
+            submitPendingDenseCommand(&hybrid_layer_cmd_storage, dense_pending_cmds[0..], &dense_pending_count, profile);
         }
         if (use_dense_layer_cmd and dense_group_cmd_storage.handle != null) {
             const next_layer = layer_idx + 1;
