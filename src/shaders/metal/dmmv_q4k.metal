@@ -29,6 +29,10 @@ struct DmmvPush {
 #define BLOCK_SIZE 144
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
+#ifndef ZINC_Q4K_FIXED_BLOCKS
+#define ZINC_Q4K_FIXED_BLOCKS 0
+#endif
+
 kernel void main0(
     device const uchar* W [[buffer(0)]],
     constant DmmvPush& p [[buffer(1)]],
@@ -47,14 +51,22 @@ kernel void main0(
     const short iq = it / 4;     // 0 or 1
     const short ir = it % 4;     // 0..3
 
+#if ZINC_Q4K_FIXED_BLOCKS
+    constexpr int nb = ZINC_Q4K_FIXED_BLOCKS;
+#else
     const int nb = p.K / QK_K;   // blocks per row
+#endif
 
     const int r0 = tgpig.x;
 
     const int first_row = (r0 * NSG + sgitg) * NR0;
 
     // nb01 in llama.cpp is the byte stride per row = nb * sizeof(block_q4_K)
+#if ZINC_Q4K_FIXED_BLOCKS
+    constexpr int nb01 = ZINC_Q4K_FIXED_BLOCKS * BLOCK_SIZE;
+#else
     const int nb01 = nb * BLOCK_SIZE;
+#endif
 
     device const uchar* src0 = W + p.a_offset;
     device const float* src1 = X + (p.x_offset / 4);

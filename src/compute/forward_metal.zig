@@ -262,6 +262,7 @@ fn supportsDenseQ6kSimdgroupDmmvArch(arch: config_mod.Architecture) bool {
 }
 
 const qwen35_27b_dense_down_q6k_blocks: u32 = 68; // 17408 / QK_K
+const qwen35_27b_dense_gate_up_q4k_blocks: u32 = 20; // 5120 / QK_K
 
 fn isQwen35DenseDownQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
     return cfg.architecture == .qwen35 and
@@ -271,6 +272,17 @@ fn isQwen35DenseDownQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32,
         K == cfg.intermediate_dim and
         K == qwen35_27b_dense_down_q6k_blocks * 256 and
         std.mem.endsWith(u8, tensor_name, "ffn_down.weight");
+}
+
+fn isQwen35DenseGateUpQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        M == cfg.intermediate_dim and
+        K == cfg.hidden_dim and
+        K == qwen35_27b_dense_gate_up_q4k_blocks * 256 and
+        (std.mem.endsWith(u8, tensor_name, "ffn_gate.weight") or
+            std.mem.endsWith(u8, tensor_name, "ffn_up.weight"));
 }
 
 fn canUseDenseQ6kSimdgroupDmmvShape(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
@@ -4461,6 +4473,7 @@ pub const InferenceEngine = struct {
     // DMMV compute pipelines (one per quant type)
     dmmv_q4k_pipe: MetalPipeline,
     dmmv_q4k_k2048_pipe: MetalPipeline,
+    dmmv_q4k_k5120_pipe: MetalPipeline,
     dmmv_q4k_dual_pipe: MetalPipeline,
     dmmv_q4k_dual_llama_pipe: MetalPipeline,
     dmmv_q4k_qk_dual_pipe: MetalPipeline,
@@ -5175,6 +5188,12 @@ pub const InferenceEngine = struct {
         // Load DMMV compute pipelines for all quant types
         self.dmmv_q4k_pipe = try loadShaderPipeline(ctx, "dmmv_q4k");
         self.dmmv_q4k_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_k2048");
+        self.dmmv_q4k_k5120_pipe = try loadShaderPipelineWithPrefix(
+            ctx,
+            "dmmv_q4k_k5120",
+            "dmmv_q4k",
+            "#define ZINC_Q4K_FIXED_BLOCKS 20\n",
+        );
         self.dmmv_q4k_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual");
         self.dmmv_q4k_dual_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual_llama");
         self.dmmv_q4k_qk_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qk_dual");
@@ -6144,6 +6163,7 @@ pub const InferenceEngine = struct {
 
         metal_pipeline.freePipeline(&self.dmmv_q4k_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_k2048_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_k5120_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dual_llama_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_qk_dual_pipe);
@@ -8362,6 +8382,16 @@ pub const InferenceEngine = struct {
         return switch (tensor.info.type_) {
             .q4_k => blk: {
                 const k2048_or_less = K <= 2048;
+                if (isQwen35DenseGateUpQ4kTarget(self.config, tensor.info.name, M, K) and
+                    self.dmmv_q4k_k5120_pipe.handle != null)
+                {
+                    // Qwen3.6 27B dense gate/up is the hottest Q4_K bucket
+                    // (M=17408,K=5120). Keep the same llama-style single
+                    // projection path that stayed correct in cycle 6, but bake
+                    // K=5120 into the shader so row stride and block trip count
+                    // are compile-time constants.
+                    break :blk .{ .pipe = &self.dmmv_q4k_k5120_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
+                }
                 if (k2048_or_less and
                     self.device.chip.isM5Class() and
                     tensor == self.lm_head and
@@ -29790,6 +29820,10 @@ test "dense q6k simdgroup route covers qwen35 27b down exact shape" {
     try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
     try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ssm_out.weight", 10240, 5120));
     try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "output.weight", 248320, 5120));
+    try std.testing.expect(isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_gate.weight", 17408, 5120));
+    try std.testing.expect(isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_up.weight", 17408, 5120));
+    try std.testing.expect(!isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
+    try std.testing.expect(!isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ssm_out.weight", 10240, 5120));
 }
 
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
@@ -30597,6 +30631,13 @@ test "batched MoE Metal shaders compile" {
         "#define ZINC_Q6K_FIXED_BLOCKS 68\n",
     );
     defer metal_pipeline.freePipeline(&dmmv_q6k_llama_k17408_pipe);
+    var dmmv_q4k_k5120_pipe = try loadShaderPipelineWithPrefix(
+        ctx,
+        "dmmv_q4k_k5120",
+        "dmmv_q4k",
+        "#define ZINC_Q4K_FIXED_BLOCKS 20\n",
+    );
+    defer metal_pipeline.freePipeline(&dmmv_q4k_k5120_pipe);
     var gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
     defer metal_pipeline.freePipeline(&gemm_q5k_pipe);
 
