@@ -133,7 +133,7 @@ hybrid path streams dense FFN weights on every layer.
 
 ## Current checkpoint
 
-Updated after local M4 run `.metal_optimize/2026-06-12T22-31-20` cycles 1-6:
+Updated after local M4 run `.metal_optimize/2026-06-12T22-31-20` cycles 1-9:
 
 - Baseline locked at `10.48 decode tok/s` on the effort prompt.
 - Cycle 1 kept profile enablement for dense FFN gate/up/down byte buckets.
@@ -154,9 +154,15 @@ Updated after local M4 run `.metal_optimize/2026-06-12T22-31-20` cycles 1-6:
 - Cycle 6 kept a neutral fixed-`K=17408` Q6_K pipeline specialization for the
   same dense-down shape. It measured `12.56 tok/s`, so treat it as cleanup /
   enablement around the proven cycle-4 route, not as a separate speed win.
-- Cross-effort prefill improved from `11.60` to `14.20 tok/s` after the Q6_K
-  dense-down work (`+22.4%`), so keep this route while watching long prompt
-  correctness.
+- Cycle 7 kept a neutral fixed-`K=5120` Q4_K pipeline for dense
+  `ffn_gate.weight` / `ffn_up.weight`; it measured `12.55 tok/s`.
+- Cycle 8 kept a neutral fixed-`K=17408` Q4_K route for dense
+  `ffn_down.weight`; it measured `12.55 tok/s`.
+- Cycle 9 kept the second real win: route exact Qwen3.6 27B SSM Q6_K
+  `attn_qkv.weight` `M=10240 K=5120` through the existing llama-style Metal
+  Q6_K DMMV path. Median moved to `13.15 decode tok/s`.
+- Cross-effort prefill improved from `11.60` to `15.00 tok/s` (`+29.3%`), so
+  keep the Q6_K dense/SSM routes while watching long prompt correctness.
 
 Cycle-2 promoted-best profile:
 
@@ -179,10 +185,14 @@ Best next directions from this checkpoint:
 2. Treat Q4_K dense gate/up `M=17408 K=5120` as hot, but do not re-enable the
    existing `.qwen35` fused gate/up+SwiGLU path or the non-SwiGLU dual route
    without explaining the cycle-3/cycle-5 slowdowns.
-3. SSM projection is the next non-dense bucket; profile any SSM change against
-   the dense down target so the loop does not drift.
-4. LM head is visible but smaller than dense down. Do not chase it before the
-   dense and SSM buckets unless a profile moves it higher.
+3. Continue SSM projection work from the exact Q6_K `attn_qkv.weight`
+   `M=10240 K=5120` route. Do not broaden Q6_K routing to SSM out, LM head,
+   or other tensors without shape-specific profile evidence.
+4. The fixed-K Q4_K single-projection routes were neutral. Keep them only as
+   harmless specialization cleanup; future Q4_K work needs shader-level
+   evidence, not more selector variants.
+5. LM head is visible but smaller than dense and SSM buckets. Do not chase it
+   before the dense and SSM buckets unless a profile moves it higher.
 
 ## First-cycle checklist
 
