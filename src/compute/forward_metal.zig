@@ -5377,7 +5377,7 @@ pub const InferenceEngine = struct {
             ctx,
             "dmmv_q6k_llama_k17408",
             "dmmv_q6k_llama",
-            "#define ZINC_Q6K_FIXED_BLOCKS 68\n",
+            "#define ZINC_Q6K_FIXED_BLOCKS 68\n#define ZINC_Q6K_NSG 4\n",
         );
         self.dmmv_q8_0_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0");
         self.dmmv_q5_0_pipe = try loadShaderPipeline(ctx, "dmmv_q5_0");
@@ -8612,7 +8612,7 @@ pub const InferenceEngine = struct {
                     if (isQwen35DenseDownQ6kTarget(self.config, tensor.info.name, M, K) and
                         self.dmmv_q6k_llama_k17408_pipe.handle != null)
                     {
-                        break :blk .{ .pipe = &self.dmmv_q6k_llama_k17408_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
+                        break :blk .{ .pipe = &self.dmmv_q6k_llama_k17408_pipe, .push_idx = 1, .rows_per_wg = 8, .block_size = 128 };
                     }
                     if (self.dmmv_q6k_llama_pipe.handle != null) {
                         break :blk .{ .pipe = &self.dmmv_q6k_llama_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
@@ -11890,12 +11890,16 @@ fn dispatchDenseQ6kSimdgroupDmmvOnCmd(
             .y_offset = 0,
         };
         const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
-        const rows_per_wg: u32 = 4;
+        const uses_dense_down_nsg4 =
+            selected_pipe == &engine.dmmv_q6k_llama_k17408_pipe and
+            isQwen35DenseDownQ6kTarget(engine.config, tensor.info.name, M, K);
+        const rows_per_wg: u32 = if (uses_dense_down_nsg4) 8 else 4;
         const wgs = (M + rows_per_wg - 1) / rows_per_wg;
         var timing_label_buf: [192]u8 = undefined;
         const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, M, K, selected_pipe, &timing_label_buf);
         defer if (has_timing_label) cmd.clearTimingLabel();
-        cmd.dispatchV2(selected_pipe, .{ wgs, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 1);
+        const block_size: u32 = if (uses_dense_down_nsg4) 128 else 64;
+        cmd.dispatchV2(selected_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 1);
         return;
     }
 
