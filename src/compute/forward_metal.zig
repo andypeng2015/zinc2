@@ -5352,7 +5352,7 @@ pub const InferenceEngine = struct {
             ctx,
             "dmmv_q4k_k5120",
             "dmmv_q4k",
-            "#define ZINC_Q4K_FIXED_BLOCKS 20\n",
+            "#define ZINC_Q4K_FIXED_BLOCKS 20\n#define ZINC_Q4K_NSG 4\n",
         );
         self.dmmv_q4k_k17408_pipe = try loadShaderPipelineWithPrefix(
             ctx,
@@ -8557,10 +8557,11 @@ pub const InferenceEngine = struct {
                 {
                     // Qwen3.6 27B dense gate/up is the hottest Q4_K bucket
                     // (M=17408,K=5120). Keep the same llama-style single
-                    // projection path that stayed correct in cycle 6, but bake
-                    // K=5120 into the shader so row stride and block trip count
-                    // are compile-time constants.
-                    break :blk .{ .pipe = &self.dmmv_q4k_k5120_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
+                    // projection path that stayed correct in cycle 6. Adapt
+                    // llama.cpp's `kernel_mul_mv_q4_K_f32_impl` row grouping
+                    // by keeping NR0=2 per simdgroup while packing four
+                    // simdgroups into each threadgroup for this exact shape.
+                    break :blk .{ .pipe = &self.dmmv_q4k_k5120_pipe, .push_idx = 1, .rows_per_wg = 8, .block_size = 128 };
                 }
                 if (isQwen35DenseDownQ4kTarget(self.config, tensor.info.name, M, K) and
                     self.dmmv_q4k_k17408_pipe.handle != null)
@@ -30983,7 +30984,7 @@ test "batched MoE Metal shaders compile" {
         ctx,
         "dmmv_q4k_k5120",
         "dmmv_q4k",
-        "#define ZINC_Q4K_FIXED_BLOCKS 20\n",
+        "#define ZINC_Q4K_FIXED_BLOCKS 20\n#define ZINC_Q4K_NSG 4\n",
     );
     defer metal_pipeline.freePipeline(&dmmv_q4k_k5120_pipe);
     var dmmv_q4k_k17408_pipe = try loadShaderPipelineWithPrefix(

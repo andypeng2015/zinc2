@@ -23,7 +23,11 @@ struct DmmvPush {
 //   [4..15]  scales (12 bytes, packed 6-bit scale/min pairs)
 //   [16..143] qs  (128 bytes, 256 x 4-bit quants)
 
-#define NSG   2
+#ifndef ZINC_Q4K_NSG
+#define ZINC_Q4K_NSG 2
+#endif
+
+#define NSG   ZINC_Q4K_NSG
 #define NR0   2
 #define QK_K  256
 #define BLOCK_SIZE 144
