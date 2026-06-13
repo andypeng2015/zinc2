@@ -23731,15 +23731,9 @@ fn runDecodeStep(
                     dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, inter_dim);
                     recordDenseFfnDispatchDelta(profile, .activation, activation_dispatch_before, cmd.dispatch_count);
                 }
-                // Adapt llama.cpp `ggml_metal_op_concurrency_reset`: the
-                // dense activation join has exactly one prior producer
-                // (gate/up+GeGLU or standalone activation) and the next down
-                // projection consumes its only output, `swiglu_buf`. Unlike
-                // the norm/tail joins, this edge is not preserving deferred
-                // hidden_buf work, so a plain buffer-scope reset avoids a hot
-                // single-resource barrier call without widening any live
-                // independent dependency.
-                profileDenseFfnBarrier(cmd, profile, .activation);
+                // Dense-down consumes only the activation row. Keep the SSM
+                // residual hidden write deferred until the down/tail join.
+                profileDenseFfnBarrierBuffers(cmd, profile, .activation, &.{&engine.swiglu_buf});
 
                 const down_dispatch_before = cmd.dispatch_count;
                 dispatchDmmvOnCmd(engine, cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
