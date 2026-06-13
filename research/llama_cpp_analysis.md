@@ -47,6 +47,34 @@ full public M4 suite on the kept tree, or collect exact Metal shape data that
 separates dense Q4 gate/up, Q6 down, and the small SSM buckets before making a
 default-on production change.
 
+### Effort 24 revalidation gate
+
+Treat the cycle-80/81 tree as a candidate checkpoint, not a publishable metric,
+until one outside-loop run records the full Qwen3.6 27B M4 public suite on the
+same workload contract: managed model `qwen36-27b-q4k-m`, raw prompt mode,
+128-token generation cap, 322-token effort prompt fingerprint for the
+context-long row, and repeated warm medians rather than single screenshots.
+
+The revalidation packet should contain:
+
+- public-suite `core`, `context-medium`, `context-long`, and `decode-extended`
+  rows against the same llama.cpp baseline provenance;
+- median and sample range for prefill, decode, total latency, and combined
+  prompt+decode throughput;
+- the slowest async decode slot split for dense Q4 gate/up, dense Q6 down, SSM
+  qkv/gate/tail/out, and LM head;
+- a note saying whether the post-parser-fix 14.69-14.73 tok/s live band or the
+  15.09 tok/s promoted checkpoint is the conservative number.
+
+Only reopen the runtime loop after that packet if it names a default-on change
+that removes a measured bucket, or if an exact-shape Metal benchmark shows a
+specific dense Q4 gate/up or Q6 down kernel route beating the current kept path.
+Without that evidence, the llama.cpp techniques studied here
+(`ggml_metal_graph_compute`, `ggml_metal_op_encode_impl`, and
+`kernel_mul_mv_q{4,6}_K_f32_impl`) should be considered already represented in
+the ZINC candidates, and vLLM `fused_moe` packing remains out of scope for this
+dense no-expert decode target.
+
 ## Architecture Detection
 
 RDNA4 (gfx1201) is classified as `AMD_RDNA3` — no RDNA4-specific enum exists.
