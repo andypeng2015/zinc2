@@ -194,6 +194,55 @@ Best next directions from this checkpoint:
 5. LM head is visible but smaller than dense and SSM buckets. Do not chase it
    before the dense and SSM buckets unless a profile moves it higher.
 
+## Post-cycle-88 checkpoint
+
+Updated after resumed local M4 run `.metal_optimize/2026-06-12T22-31-20`
+cycles 75-88:
+
+- Best promoted cycle is cycle 80 at `15.0917 decode tok/s`, commit
+  `ea522741`: exact Qwen3.6 27B Q4_K/Q4_K SSM `attn_qkv.weight` +
+  `attn_gate.weight` route through the Q4 dual-row Metal dispatch.
+- Cycle 81 is useful evidence but not a real speed step: dense Q4_K
+  `ffn_gate.weight` + `ffn_up.weight` was routed through the same single-axis
+  Q4 dual dispatch, reducing dense gate/up dispatches, but median stayed flat
+  at `15.0869 decode tok/s`.
+- A harness parsing bug was found after cycle 81: the prompt text contains the
+  phrase "generated 160 tokens", and the old parser could record that prose as
+  `tokensGenerated`. The parser now requires the engine timing form
+  `Generated N tokens in X ms/s`. Post-fix samples correctly report `128 tok`.
+- After the parser fix and resume, cycles 82-88 all measured a stable live band
+  around `14.69-14.73 decode tok/s` and were reverted. Treat the persisted
+  `15.09` best as a checkpoint that needs clean revalidation before publishing
+  site metrics.
+- Rejected post-best variants: Q4 dual nibble-mask vectorization, fixed-K5120
+  Q4 dual route, fixed-K5120 mixed Q6/Q4 SSM pair route, tail-free Q4 dual row
+  alignment, exact Q6/Q4 SSM pair specialization, dense-down tail barrier
+  narrowing, and Q4 dual `float2` accumulator cleanup. Do not repeat these
+  without new profiler evidence.
+- Latest profile interpretation: dense FFN still dominates the slowest slot,
+  and encode time is small compared with GPU execution. Cycle 81 showed that
+  simply reducing dispatch count is not enough; the remaining gap is mostly
+  kernel body / memory-traffic efficiency, especially dense FFN Q4 gate/up and
+  Q6 down bytes.
+
+Harness follow-ups before publishing:
+
+1. Revalidate the saved best tree after `--resume` before using
+   `state.bestTokPerSec` as the acceptance threshold.
+2. Add Qwen 27B dense-decode plateau guidance equivalent to the Gemma/Qwen 35B
+   plateau blocks in `loops/implement_metal.ts`: after several reverted cycles,
+   require either fresh exact-shape evidence or a structural change.
+3. Keep exact-shape microbench/validator foundation work even if decode is
+   flat, but label it `@@@STEP_KIND: analysis` or `@@@STEP_KIND: enablement`
+   and name the unlocked speed path.
+4. The generic prompt still contains older Qwen 35B MoE and Gemma guidance.
+   Effort 24 must continue to override that: no MoE route-pack or prefill-only
+   changes for this dense-decode run unless the current 27B profile names that
+   path.
+5. Before updating published metrics, rerun the full public M4 suite for
+   `qwen36-27b-q4k-m` on the committed tree and report the conservative median,
+   not the single best cycle.
+
 ## First-cycle checklist
 
 Before editing:
