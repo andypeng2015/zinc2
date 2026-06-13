@@ -861,13 +861,24 @@ fn ssmConv1dThreadgroupSize(
     d_conv: u32,
     kernel_is_f16: bool,
 ) u32 {
-    if ((conv_channels == 8192 or conv_channels == 10240) and
+    if (conv_channels == 8192 and
         d_conv == 4 and
         !kernel_is_f16 and
         pipe.thread_execution_width == 32 and
         pipe.max_threads_per_threadgroup >= 128)
     {
         return 128;
+    }
+    // Qwen3.6 27B's exact D4 conv path has no cross-thread communication.
+    // Keep its 10240 channels spread across 160 one-simdgroup workgroups
+    // instead of 80 two-simdgroup groups so more Apple9 GPU cores stay busy.
+    if (conv_channels == 10240 and
+        d_conv == 4 and
+        !kernel_is_f16 and
+        pipe.thread_execution_width == 32 and
+        pipe.max_threads_per_threadgroup >= 64)
+    {
+        return 64;
     }
     return 64;
 }
@@ -26718,6 +26729,7 @@ test "qwen ssm conv d4 threadgroup helper uses exact model shape" {
     };
 
     try std.testing.expectEqual(@as(u32, 128), ssmConv1dThreadgroupSize(&pipe, 8192, 4, false));
+    try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 10240, 4, false));
     try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 8192, 3, false));
     try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 4096, 4, false));
     try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 8192, 4, true));
