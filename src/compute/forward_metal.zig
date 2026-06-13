@@ -1159,6 +1159,14 @@ pub const RuntimeProfile = struct {
     dense_ffn_record_ns: u64 = 0,
     final_record_ns: u64 = 0,
     gpu_completion_wait_ns: u64 = 0,
+    decode_async_submits: u32 = 0,
+    decode_async_max_pending: u32 = 0,
+    decode_async_queue_waits: u32 = 0,
+    decode_async_queue_pending_cmds: u32 = 0,
+    decode_async_queue_wait_ns: u64 = 0,
+    decode_async_final_waits: u32 = 0,
+    decode_async_final_pending_cmds: u32 = 0,
+    decode_async_final_wait_ns: u64 = 0,
     sample_ns: u64 = 0,
     total_step_ns: u64 = 0,
     debug_validation_ns: u64 = 0,
@@ -1729,6 +1737,14 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.dense_ffn_record_ns = total.dense_ffn_record_ns -| prefix.dense_ffn_record_ns;
     delta.final_record_ns = total.final_record_ns -| prefix.final_record_ns;
     delta.gpu_completion_wait_ns = total.gpu_completion_wait_ns -| prefix.gpu_completion_wait_ns;
+    delta.decode_async_submits = total.decode_async_submits -| prefix.decode_async_submits;
+    delta.decode_async_max_pending = total.decode_async_max_pending;
+    delta.decode_async_queue_waits = total.decode_async_queue_waits -| prefix.decode_async_queue_waits;
+    delta.decode_async_queue_pending_cmds = total.decode_async_queue_pending_cmds -| prefix.decode_async_queue_pending_cmds;
+    delta.decode_async_queue_wait_ns = total.decode_async_queue_wait_ns -| prefix.decode_async_queue_wait_ns;
+    delta.decode_async_final_waits = total.decode_async_final_waits -| prefix.decode_async_final_waits;
+    delta.decode_async_final_pending_cmds = total.decode_async_final_pending_cmds -| prefix.decode_async_final_pending_cmds;
+    delta.decode_async_final_wait_ns = total.decode_async_final_wait_ns -| prefix.decode_async_final_wait_ns;
     delta.sample_ns = total.sample_ns -| prefix.sample_ns;
     delta.total_step_ns = total.total_step_ns -| prefix.total_step_ns;
     delta.debug_validation_ns = total.debug_validation_ns -| prefix.debug_validation_ns;
@@ -1873,6 +1889,27 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.commit_waits,
         nsToMs(profile.gpu_completion_wait_ns),
     });
+    if (profile.decode_async_submits > 0 or profile.decode_async_final_waits > 0 or profile.decode_async_queue_waits > 0) {
+        const avg_final_pending = if (profile.decode_async_final_waits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_final_pending_cmds)) / @as(f64, @floatFromInt(profile.decode_async_final_waits))
+        else
+            0.0;
+        const avg_queue_pending = if (profile.decode_async_queue_waits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_queue_pending_cmds)) / @as(f64, @floatFromInt(profile.decode_async_queue_waits))
+        else
+            0.0;
+        log.info("  {s} async decode queue: submits {d} max_pending {d} final_waits {d} avg_pending/final {d:.1} final_wait {d:.2} ms | queue_waits {d} avg_pending/queue {d:.1} queue_wait {d:.2} ms", .{
+            label,
+            profile.decode_async_submits,
+            profile.decode_async_max_pending,
+            profile.decode_async_final_waits,
+            avg_final_pending,
+            nsToMs(profile.decode_async_final_wait_ns),
+            profile.decode_async_queue_waits,
+            avg_queue_pending,
+            nsToMs(profile.decode_async_queue_wait_ns),
+        });
+    }
     log.info("  {s} moe finalizers: scalar+norm {d} scalar {d} f32+seed+norm {d} f32+norm {d} f32 {d} shared {d} routed {d} | gemma weighted+post {d} post {d} staged {d}", .{
         label,
         profile.gpu_moe_finalizer_scalar_seed_norm_calls,
@@ -21836,7 +21873,11 @@ fn beginProfiledCommand(engine: *InferenceEngine, profile: ?*RuntimeProfile) !Me
     return cmd;
 }
 
-fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
+fn saturatingU32FromUsize(value: usize) u32 {
+    return @intCast(@min(value, @as(usize, std.math.maxInt(u32))));
+}
+
+fn commitAndWaitProfiledMeasured(cmd: *MetalCommand, profile: ?*RuntimeProfile) u64 {
     if (profile) |p| {
         p.dispatch_calls += cmd.dispatch_count;
         p.barrier_calls += cmd.barrier_count;
@@ -21846,10 +21887,26 @@ fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     }
     const commit_start = profileStart(profile != null);
     cmd.commitAndWait();
+    const wait_ns = profileElapsedNs(commit_start);
     if (profile) |p| {
         p.commit_waits += 1;
         // This wall time is the full command-buffer completion wait, not just CPU submit overhead.
-        p.gpu_completion_wait_ns += profileElapsedNs(commit_start);
+        p.gpu_completion_wait_ns += wait_ns;
+    }
+    return wait_ns;
+}
+
+fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
+    _ = commitAndWaitProfiledMeasured(cmd, profile);
+}
+
+fn commitFinalCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile, pending_count: usize) void {
+    const wait_ns = commitAndWaitProfiledMeasured(cmd, profile);
+    if (pending_count == 0) return;
+    if (profile) |p| {
+        p.decode_async_final_waits += 1;
+        p.decode_async_final_pending_cmds += saturatingU32FromUsize(pending_count);
+        p.decode_async_final_wait_ns += wait_ns;
     }
 }
 
@@ -21864,13 +21921,19 @@ fn commitAsyncProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     cmd.commitAsync();
 }
 
-fn waitCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
+fn waitCommandProfiledMeasured(cmd: *MetalCommand, profile: ?*RuntimeProfile) u64 {
     const wait_start = profileStart(profile != null);
     cmd.wait();
+    const wait_ns = profileElapsedNs(wait_start);
     if (profile) |p| {
         p.commit_waits += 1;
-        p.gpu_completion_wait_ns += profileElapsedNs(wait_start);
+        p.gpu_completion_wait_ns += wait_ns;
     }
+    return wait_ns;
+}
+
+fn waitCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
+    _ = waitCommandProfiledMeasured(cmd, profile);
 }
 
 fn releaseCommands(cmds: []MetalCommand) void {
@@ -21892,7 +21955,12 @@ fn waitPendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*Runt
     // Metal command queues execute command buffers in commit order. Mirroring
     // llama.cpp's graph submission pattern, wait on the last dense chunk to
     // synchronize the token, then release the already-completed earlier chunks.
-    waitCommandProfiled(&cmds[n - 1], profile);
+    const wait_ns = waitCommandProfiledMeasured(&cmds[n - 1], profile);
+    if (profile) |p| {
+        p.decode_async_queue_waits += 1;
+        p.decode_async_queue_pending_cmds += saturatingU32FromUsize(n);
+        p.decode_async_queue_wait_ns += wait_ns;
+    }
     releaseCompletedCommands(cmds[0 .. n - 1]);
     count.* = 0;
 }
@@ -21914,6 +21982,11 @@ fn submitPendingDenseCommand(
     }
 
     commitAsyncProfiled(cmd, profile);
+    if (profile) |p| {
+        p.decode_async_submits += 1;
+        const pending_after_submit = saturatingU32FromUsize(pending_count.* + 1);
+        p.decode_async_max_pending = @max(p.decode_async_max_pending, pending_after_submit);
+    }
     pending_cmds[pending_count.*] = cmd.*;
     pending_count.* += 1;
     cmd.* = .{
@@ -24183,11 +24256,11 @@ fn runDecodeStep(
         if (final_norm_ready_from_dense_tail) {
             dispatchLmHeadAndArgmaxOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, &engine.argmax_buf, hidden_dim, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(cmd, profile);
+            commitFinalCommandProfiled(cmd, profile, dense_pending_count);
         } else if (cpu_lm_head) {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrier(cmd, profile, .final);
-            commitAndWaitProfiled(cmd, profile);
+            commitFinalCommandProfiled(cmd, profile, dense_pending_count);
             const in_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
             const out_ptr: [*]f32 = @ptrCast(@alignCast(engine.logits_buf.cpu_ptr.?));
             try cpuLmHeadFallbackWithArgmax(engine, in_ptr, out_ptr);
@@ -24200,13 +24273,13 @@ fn runDecodeStep(
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.logits_buf});
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(cmd, profile);
+            commitFinalCommandProfiled(cmd, profile, dense_pending_count);
         } else {
             dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
             profileBarrierBuffers(cmd, profile, .final, &.{&engine.norm_buf});
             dispatchLmHeadAndArgmaxOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, &engine.argmax_buf, hidden_dim, cfg.vocab_size, profile);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(cmd, profile);
+            commitFinalCommandProfiled(cmd, profile, dense_pending_count);
         }
     }
     releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
