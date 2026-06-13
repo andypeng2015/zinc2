@@ -1899,6 +1899,28 @@ fn profileDenseFfnBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, 
     recordDenseFfnBarrierEncodeNs(profile, phase, elapsed_ns, scope_delta, resource_delta);
 }
 
+fn profileDenseFfnResourceBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase, bufs: []const *const MetalBuffer) void {
+    const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
+    const barrier_start = profileStart(profile != null);
+    cmd.barrierResourceBuffers(bufs);
+    const elapsed_ns = profileElapsedNs(barrier_start);
+    if (cmd.barrier_count == before_count) return;
+    const scope_delta = cmd.scope_barrier_count -| before_scope_count;
+    const resource_delta = cmd.resource_barrier_count -| before_resource_count;
+    recordDenseFfnBarrierPhase(profile, phase);
+    recordDenseFfnBarrierKind(
+        profile,
+        phase,
+        scope_delta,
+        resource_delta,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
+    recordDenseFfnBarrierEncodeNs(profile, phase, elapsed_ns, scope_delta, resource_delta);
+}
+
 fn profileDenseFfnTailBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant) void {
     const before_count = cmd.barrier_count;
     const before_scope_count = cmd.scope_barrier_count;
@@ -25553,7 +25575,16 @@ fn runDecodeStep(
                     try validateDenseGemmaQ4KGeGLUOnCmd(engine, cmd, profile, layer_idx, gate_t, up_t, inter_dim, hidden_dim);
                 }
                 if (!fused_gate_up) {
-                    profileDenseFfnBarrierBuffers(cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
+                    if (use_hybrid_layer_cmd and defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+                        // llama.cpp's `ggml_metal_op_concurrency_check` only
+                        // resets when the next op conflicts with tracked
+                        // resource ranges. SwiGLU reads gate/up only; the
+                        // prior residual write to hidden_buf is joined later
+                        // at dense-down/residual, so do not drain it here.
+                        profileDenseFfnResourceBarrierBuffers(cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
+                    } else {
+                        profileDenseFfnBarrierBuffers(cmd, profile, .gate_up, &.{ &engine.gate_buf, &engine.up_buf });
+                    }
                     const activation_dispatch_before = cmd.dispatch_count;
                     dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, inter_dim);
                     recordDenseFfnDispatchDelta(profile, .activation, activation_dispatch_before, cmd.dispatch_count);
