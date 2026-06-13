@@ -1001,6 +1001,55 @@ const SsmBarrierPhase = enum(u8) {
     residual,
 };
 
+const SsmBarrierPhaseCounters = struct {
+    proj_norm: u32 = 0,
+    qkv: u32 = 0,
+    tail: u32 = 0,
+    conv: u32 = 0,
+    delta: u32 = 0,
+    gated_norm: u32 = 0,
+    out: u32 = 0,
+    residual: u32 = 0,
+
+    fn add(self: *SsmBarrierPhaseCounters, phase: SsmBarrierPhase, value: u32) void {
+        if (value == 0) return;
+        switch (phase) {
+            .proj_norm => self.proj_norm += value,
+            .qkv => self.qkv += value,
+            .tail => self.tail += value,
+            .conv => self.conv += value,
+            .delta => self.delta += value,
+            .gated_norm => self.gated_norm += value,
+            .out => self.out += value,
+            .residual => self.residual += value,
+        }
+    }
+
+    fn total(self: SsmBarrierPhaseCounters) u32 {
+        return self.proj_norm +
+            self.qkv +
+            self.tail +
+            self.conv +
+            self.delta +
+            self.gated_norm +
+            self.out +
+            self.residual;
+    }
+
+    fn diff(total_counts: SsmBarrierPhaseCounters, prefix_counts: SsmBarrierPhaseCounters) SsmBarrierPhaseCounters {
+        return .{
+            .proj_norm = total_counts.proj_norm -| prefix_counts.proj_norm,
+            .qkv = total_counts.qkv -| prefix_counts.qkv,
+            .tail = total_counts.tail -| prefix_counts.tail,
+            .conv = total_counts.conv -| prefix_counts.conv,
+            .delta = total_counts.delta -| prefix_counts.delta,
+            .gated_norm = total_counts.gated_norm -| prefix_counts.gated_norm,
+            .out = total_counts.out -| prefix_counts.out,
+            .residual = total_counts.residual -| prefix_counts.residual,
+        };
+    }
+};
+
 const GpuMoeBarrierPhase = enum(u8) {
     router,
     gate_up,
@@ -1104,6 +1153,9 @@ pub const RuntimeProfile = struct {
     ssm_gated_norm_barrier_calls: u32 = 0,
     ssm_out_barrier_calls: u32 = 0,
     ssm_residual_barrier_calls: u32 = 0,
+    ssm_scope_barrier_calls_by_phase: SsmBarrierPhaseCounters = .{},
+    ssm_resource_barrier_calls_by_phase: SsmBarrierPhaseCounters = .{},
+    ssm_resource_barrier_resources_by_phase: SsmBarrierPhaseCounters = .{},
     router_barrier_calls: u32 = 0,
     gpu_routed_moe_barrier_calls: u32 = 0,
     gpu_moe_router_barrier_calls: u32 = 0,
@@ -1347,25 +1399,69 @@ fn recordSsmBarrierPhase(profile: ?*RuntimeProfile, phase: SsmBarrierPhase) void
     }
 }
 
+fn recordSsmBarrierKind(
+    profile: ?*RuntimeProfile,
+    phase: SsmBarrierPhase,
+    scope_delta: u32,
+    resource_delta: u32,
+    resource_entries_delta: u32,
+) void {
+    if (profile) |p| {
+        p.ssm_scope_barrier_calls_by_phase.add(phase, scope_delta);
+        p.ssm_resource_barrier_calls_by_phase.add(phase, resource_delta);
+        p.ssm_resource_barrier_resources_by_phase.add(phase, resource_entries_delta);
+    }
+}
+
 fn profileSsmBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: SsmBarrierPhase) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
     cmd.barrier();
     if (cmd.barrier_count == before_count) return;
     recordSsmBarrierPhase(profile, phase);
+    recordSsmBarrierKind(
+        profile,
+        phase,
+        cmd.scope_barrier_count -| before_scope_count,
+        cmd.resource_barrier_count -| before_resource_count,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
 }
 
 fn profileSsmBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: SsmBarrierPhase, bufs: []const *const MetalBuffer) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
     cmd.barrierBuffers(bufs);
     if (cmd.barrier_count == before_count) return;
     recordSsmBarrierPhase(profile, phase);
+    recordSsmBarrierKind(
+        profile,
+        phase,
+        cmd.scope_barrier_count -| before_scope_count,
+        cmd.resource_barrier_count -| before_resource_count,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
 }
 
 fn profileSsmResourceBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: SsmBarrierPhase, bufs: []const *const MetalBuffer) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
     cmd.barrierResourceBuffers(bufs);
     if (cmd.barrier_count == before_count) return;
     recordSsmBarrierPhase(profile, phase);
+    recordSsmBarrierKind(
+        profile,
+        phase,
+        cmd.scope_barrier_count -| before_scope_count,
+        cmd.resource_barrier_count -| before_resource_count,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
 }
 
 fn recordGpuMoeBarrierPhase(profile: ?*RuntimeProfile, phase: GpuMoeBarrierPhase) void {
@@ -1755,6 +1851,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.ssm_gated_norm_barrier_calls = total.ssm_gated_norm_barrier_calls -| prefix.ssm_gated_norm_barrier_calls;
     delta.ssm_out_barrier_calls = total.ssm_out_barrier_calls -| prefix.ssm_out_barrier_calls;
     delta.ssm_residual_barrier_calls = total.ssm_residual_barrier_calls -| prefix.ssm_residual_barrier_calls;
+    delta.ssm_scope_barrier_calls_by_phase = SsmBarrierPhaseCounters.diff(total.ssm_scope_barrier_calls_by_phase, prefix.ssm_scope_barrier_calls_by_phase);
+    delta.ssm_resource_barrier_calls_by_phase = SsmBarrierPhaseCounters.diff(total.ssm_resource_barrier_calls_by_phase, prefix.ssm_resource_barrier_calls_by_phase);
+    delta.ssm_resource_barrier_resources_by_phase = SsmBarrierPhaseCounters.diff(total.ssm_resource_barrier_resources_by_phase, prefix.ssm_resource_barrier_resources_by_phase);
     delta.router_barrier_calls = total.router_barrier_calls -| prefix.router_barrier_calls;
     delta.gpu_routed_moe_barrier_calls = total.gpu_routed_moe_barrier_calls -| prefix.gpu_routed_moe_barrier_calls;
     delta.fallback_moe_barrier_calls = total.fallback_moe_barrier_calls -| prefix.fallback_moe_barrier_calls;
@@ -2089,6 +2188,51 @@ fn denseGemmaQ4KGeGLUValidationTensorName(tensor: DenseGemmaQ4KGeGLUValidationTe
     };
 }
 
+fn logSsmBarrierKindBreakdown(label: []const u8, profile: RuntimeProfile) void {
+    const scope = profile.ssm_scope_barrier_calls_by_phase;
+    const resource = profile.ssm_resource_barrier_calls_by_phase;
+    const entries = profile.ssm_resource_barrier_resources_by_phase;
+    if (scope.total() > 0) {
+        log.info("  {s} ssm scope barriers: proj-norm {d} qkv {d} tail {d} conv {d} delta {d} gated {d} out {d} residual {d}", .{
+            label,
+            scope.proj_norm,
+            scope.qkv,
+            scope.tail,
+            scope.conv,
+            scope.delta,
+            scope.gated_norm,
+            scope.out,
+            scope.residual,
+        });
+    }
+    if (resource.total() > 0) {
+        log.info("  {s} ssm resource barriers: proj-norm {d} qkv {d} tail {d} conv {d} delta {d} gated {d} out {d} residual {d}", .{
+            label,
+            resource.proj_norm,
+            resource.qkv,
+            resource.tail,
+            resource.conv,
+            resource.delta,
+            resource.gated_norm,
+            resource.out,
+            resource.residual,
+        });
+    }
+    if (entries.total() > 0) {
+        log.info("  {s} ssm resource barrier entries: proj-norm {d} qkv {d} tail {d} conv {d} delta {d} gated {d} out {d} residual {d}", .{
+            label,
+            entries.proj_norm,
+            entries.qkv,
+            entries.tail,
+            entries.conv,
+            entries.delta,
+            entries.gated_norm,
+            entries.out,
+            entries.residual,
+        });
+    }
+}
+
 fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
     if (profile.decode_steps > 0) {
         const steps_f = @as(f64, @floatFromInt(profile.decode_steps));
@@ -2199,6 +2343,7 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.ssm_residual_barrier_calls,
             other_ssm_barriers,
         });
+        logSsmBarrierKindBreakdown(label, profile);
     }
 
     if (profile.dense_ffn_barrier_calls > 0) {
@@ -8436,6 +8581,7 @@ pub const InferenceEngine = struct {
                     profile.ssm_residual_barrier_calls,
                     other_ssm_barriers,
                 });
+                logSsmBarrierKindBreakdown("request", profile);
             }
             if (profile.gpu_routed_moe_barrier_calls > 0) {
                 const typed_gpu_moe_barriers =
@@ -30488,6 +30634,18 @@ test "profile split preserves SSM and dense tail phase counters" {
         .ssm_gated_norm_barrier_calls = 6,
         .ssm_out_barrier_calls = 7,
         .ssm_residual_barrier_calls = 8,
+        .ssm_scope_barrier_calls_by_phase = .{
+            .conv = 2,
+            .gated_norm = 3,
+        },
+        .ssm_resource_barrier_calls_by_phase = .{
+            .out = 4,
+            .residual = 5,
+        },
+        .ssm_resource_barrier_resources_by_phase = .{
+            .out = 8,
+            .residual = 13,
+        },
         .dense_ffn_tail_post_norm_next_norm_barrier_calls = 9,
         .dense_ffn_tail_residual_next_norm_barrier_calls = 10,
         .dense_ffn_tail_residual_acc_barrier_calls = 11,
@@ -30508,6 +30666,18 @@ test "profile split preserves SSM and dense tail phase counters" {
         .ssm_gated_norm_barrier_calls = 66,
         .ssm_out_barrier_calls = 77,
         .ssm_residual_barrier_calls = 88,
+        .ssm_scope_barrier_calls_by_phase = .{
+            .conv = 12,
+            .gated_norm = 23,
+        },
+        .ssm_resource_barrier_calls_by_phase = .{
+            .out = 34,
+            .residual = 45,
+        },
+        .ssm_resource_barrier_resources_by_phase = .{
+            .out = 58,
+            .residual = 73,
+        },
         .dense_ffn_tail_post_norm_next_norm_barrier_calls = 99,
         .dense_ffn_tail_residual_next_norm_barrier_calls = 110,
         .dense_ffn_tail_residual_acc_barrier_calls = 121,
@@ -30529,6 +30699,12 @@ test "profile split preserves SSM and dense tail phase counters" {
     try std.testing.expectEqual(@as(u32, 60), delta.ssm_gated_norm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 70), delta.ssm_out_barrier_calls);
     try std.testing.expectEqual(@as(u32, 80), delta.ssm_residual_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 10), delta.ssm_scope_barrier_calls_by_phase.conv);
+    try std.testing.expectEqual(@as(u32, 20), delta.ssm_scope_barrier_calls_by_phase.gated_norm);
+    try std.testing.expectEqual(@as(u32, 30), delta.ssm_resource_barrier_calls_by_phase.out);
+    try std.testing.expectEqual(@as(u32, 40), delta.ssm_resource_barrier_calls_by_phase.residual);
+    try std.testing.expectEqual(@as(u32, 50), delta.ssm_resource_barrier_resources_by_phase.out);
+    try std.testing.expectEqual(@as(u32, 60), delta.ssm_resource_barrier_resources_by_phase.residual);
     try std.testing.expectEqual(@as(u32, 90), delta.dense_ffn_tail_post_norm_next_norm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 100), delta.dense_ffn_tail_residual_next_norm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 110), delta.dense_ffn_tail_residual_acc_barrier_calls);
