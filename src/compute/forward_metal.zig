@@ -23102,7 +23102,14 @@ fn runDecodeStep(
                 }
             }
             if (!is_moe and layer_shared_cmd != null) {
-                profileDenseFfnBarrier(cmd, profile, .norm);
+                if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+                    // Dense gate/up consumes only the FFN norm row. The later
+                    // dense-down scope barrier still orders the paired hidden
+                    // residual write before the FFN tail reads hidden_buf.
+                    profileDenseFfnBarrierBuffers(cmd, profile, .norm, &.{&engine.norm_buf});
+                } else {
+                    profileDenseFfnBarrier(cmd, profile, .norm);
+                }
             }
             if (is_moe and !skip_pre_ffn_router) {
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
