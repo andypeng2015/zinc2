@@ -1151,6 +1151,8 @@ const GpuMoeFinalizerKind = enum(u8) {
     gemma_staged,
 };
 
+const decode_async_profile_slots = 16;
+
 /// Per-request profiling counters for dispatch, barrier, and timing breakdown.
 pub const RuntimeProfile = struct {
     decode_steps: u32 = 0,
@@ -1285,6 +1287,10 @@ pub const RuntimeProfile = struct {
     decode_async_final_dispatch_calls: u32 = 0,
     decode_async_final_barrier_calls: u32 = 0,
     decode_async_final_resource_barrier_resources: u32 = 0,
+    decode_async_slot_submits: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_dispatch_calls: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_barrier_calls: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_resource_barrier_resources: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
     sample_ns: u64 = 0,
     total_step_ns: u64 = 0,
     debug_validation_ns: u64 = 0,
@@ -1855,6 +1861,11 @@ fn bytesToGiB(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0;
 }
 
+fn avgCount(total: u32, count: u32) f64 {
+    if (count == 0) return 0.0;
+    return @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(count));
+}
+
 fn dmmvShapeStatMinusPrefix(total_slot: DmmvShapeStat, prefix_stats: []const DmmvShapeStat) DmmvShapeStat {
     if (total_slot.calls == 0) return .{};
 
@@ -2015,6 +2026,12 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.decode_async_final_dispatch_calls = total.decode_async_final_dispatch_calls -| prefix.decode_async_final_dispatch_calls;
     delta.decode_async_final_barrier_calls = total.decode_async_final_barrier_calls -| prefix.decode_async_final_barrier_calls;
     delta.decode_async_final_resource_barrier_resources = total.decode_async_final_resource_barrier_resources -| prefix.decode_async_final_resource_barrier_resources;
+    for (0..decode_async_profile_slots) |idx| {
+        delta.decode_async_slot_submits[idx] = total.decode_async_slot_submits[idx] -| prefix.decode_async_slot_submits[idx];
+        delta.decode_async_slot_dispatch_calls[idx] = total.decode_async_slot_dispatch_calls[idx] -| prefix.decode_async_slot_dispatch_calls[idx];
+        delta.decode_async_slot_barrier_calls[idx] = total.decode_async_slot_barrier_calls[idx] -| prefix.decode_async_slot_barrier_calls[idx];
+        delta.decode_async_slot_resource_barrier_resources[idx] = total.decode_async_slot_resource_barrier_resources[idx] -| prefix.decode_async_slot_resource_barrier_resources[idx];
+    }
     delta.sample_ns = total.sample_ns -| prefix.sample_ns;
     delta.total_step_ns = total.total_step_ns -| prefix.total_step_ns;
     delta.debug_validation_ns = total.debug_validation_ns -| prefix.debug_validation_ns;
@@ -2218,6 +2235,7 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             avg_final_barriers,
             avg_final_resource_entries,
         });
+        logDecodeAsyncSlotBreakdown(label, profile);
     }
     log.info("  {s} moe finalizers: scalar+norm {d} scalar {d} f32+seed+norm {d} f32+norm {d} f32 {d} shared {d} routed {d} | gemma weighted+post {d} post {d} staged {d}", .{
         label,
@@ -2420,6 +2438,26 @@ fn logDenseFfnBarrierKindBreakdown(label: []const u8, profile: RuntimeProfile) v
             entries.down,
             entries.tail,
             entries.scale,
+        });
+    }
+}
+
+fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void {
+    var emitted_header = false;
+    for (0..decode_async_profile_slots) |slot| {
+        const submits = profile.decode_async_slot_submits[slot];
+        if (submits == 0) continue;
+        if (!emitted_header) {
+            log.info("  {s} async decode chunk slots: slot submits avg_dispatch avg_barriers avg_resource_entries", .{label});
+            emitted_header = true;
+        }
+        log.info("  {s} async decode chunk slot {d}: {d} {d:.1} {d:.1} {d:.1}", .{
+            label,
+            slot,
+            submits,
+            avgCount(profile.decode_async_slot_dispatch_calls[slot], submits),
+            avgCount(profile.decode_async_slot_barrier_calls[slot], submits),
+            avgCount(profile.decode_async_slot_resource_barrier_resources[slot], submits),
         });
     }
 }
@@ -22451,6 +22489,11 @@ fn submitPendingDenseCommand(
         p.decode_async_submitted_dispatch_calls += cmd.dispatch_count;
         p.decode_async_submitted_barrier_calls += cmd.barrier_count;
         p.decode_async_submitted_resource_barrier_resources += cmd.resource_barrier_resources;
+        const slot = @min(pending_count.*, decode_async_profile_slots - 1);
+        p.decode_async_slot_submits[slot] += 1;
+        p.decode_async_slot_dispatch_calls[slot] += cmd.dispatch_count;
+        p.decode_async_slot_barrier_calls[slot] += cmd.barrier_count;
+        p.decode_async_slot_resource_barrier_resources[slot] += cmd.resource_barrier_resources;
     }
     commitAsyncProfiled(cmd, profile);
     if (profile) |p| {
@@ -30828,7 +30871,7 @@ test "DMMV hot-shape profile keeps dense gate and up separate" {
 }
 
 test "profile split preserves SSM and dense tail phase counters" {
-    const prefix = RuntimeProfile{
+    var prefix = RuntimeProfile{
         .decode_async_submitted_dispatch_calls = 90,
         .decode_async_submitted_barrier_calls = 80,
         .decode_async_submitted_resource_barrier_resources = 70,
@@ -30866,7 +30909,16 @@ test "profile split preserves SSM and dense tail phase counters" {
         .dense_ffn_tail_residual_acc_calls = 16,
         .dense_ffn_tail_final_norm_calls = 17,
     };
-    const total = RuntimeProfile{
+    prefix.decode_async_slot_submits[0] = 2;
+    prefix.decode_async_slot_dispatch_calls[0] = 20;
+    prefix.decode_async_slot_barrier_calls[0] = 18;
+    prefix.decode_async_slot_resource_barrier_resources[0] = 16;
+    prefix.decode_async_slot_submits[1] = 3;
+    prefix.decode_async_slot_dispatch_calls[1] = 33;
+    prefix.decode_async_slot_barrier_calls[1] = 30;
+    prefix.decode_async_slot_resource_barrier_resources[1] = 27;
+
+    var total = RuntimeProfile{
         .decode_async_submitted_dispatch_calls = 900,
         .decode_async_submitted_barrier_calls = 800,
         .decode_async_submitted_resource_barrier_resources = 700,
@@ -30904,6 +30956,14 @@ test "profile split preserves SSM and dense tail phase counters" {
         .dense_ffn_tail_residual_acc_calls = 176,
         .dense_ffn_tail_final_norm_calls = 187,
     };
+    total.decode_async_slot_submits[0] = 7;
+    total.decode_async_slot_dispatch_calls[0] = 70;
+    total.decode_async_slot_barrier_calls[0] = 63;
+    total.decode_async_slot_resource_barrier_resources[0] = 56;
+    total.decode_async_slot_submits[1] = 11;
+    total.decode_async_slot_dispatch_calls[1] = 121;
+    total.decode_async_slot_barrier_calls[1] = 110;
+    total.decode_async_slot_resource_barrier_resources[1] = 99;
 
     const delta = profileDeltaForSplit(total, prefix);
     try std.testing.expectEqual(@as(u32, 810), delta.decode_async_submitted_dispatch_calls);
@@ -30912,6 +30972,14 @@ test "profile split preserves SSM and dense tail phase counters" {
     try std.testing.expectEqual(@as(u32, 540), delta.decode_async_final_dispatch_calls);
     try std.testing.expectEqual(@as(u32, 450), delta.decode_async_final_barrier_calls);
     try std.testing.expectEqual(@as(u32, 360), delta.decode_async_final_resource_barrier_resources);
+    try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_submits[0]);
+    try std.testing.expectEqual(@as(u32, 50), delta.decode_async_slot_dispatch_calls[0]);
+    try std.testing.expectEqual(@as(u32, 45), delta.decode_async_slot_barrier_calls[0]);
+    try std.testing.expectEqual(@as(u32, 40), delta.decode_async_slot_resource_barrier_resources[0]);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_submits[1]);
+    try std.testing.expectEqual(@as(u32, 88), delta.decode_async_slot_dispatch_calls[1]);
+    try std.testing.expectEqual(@as(u32, 80), delta.decode_async_slot_barrier_calls[1]);
+    try std.testing.expectEqual(@as(u32, 72), delta.decode_async_slot_resource_barrier_resources[1]);
     try std.testing.expectEqual(@as(u32, 30), delta.ssm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 10), delta.ssm_proj_norm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 20), delta.ssm_qkv_barrier_calls);
