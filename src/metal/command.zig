@@ -293,6 +293,14 @@ pub const MetalCommand = struct {
             self.handle = null;
         }
     }
+
+    /// Return Metal-reported GPU execution time for a completed async command.
+    pub fn gpuDurationNs(self: *const MetalCommand) u64 {
+        if (self.handle) |h| {
+            return shim.mtl_command_gpu_duration_ns(h);
+        }
+        return 0;
+    }
 };
 
 /// Allocate a new command buffer from the given Metal context.

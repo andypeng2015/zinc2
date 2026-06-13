@@ -1291,6 +1291,8 @@ pub const RuntimeProfile = struct {
     decode_async_slot_dispatch_calls: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
     decode_async_slot_barrier_calls: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
     decode_async_slot_resource_barrier_resources: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_completed_cmds: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
+    decode_async_slot_gpu_ns: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     sample_ns: u64 = 0,
     total_step_ns: u64 = 0,
     debug_validation_ns: u64 = 0,
@@ -2031,6 +2033,8 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
         delta.decode_async_slot_dispatch_calls[idx] = total.decode_async_slot_dispatch_calls[idx] -| prefix.decode_async_slot_dispatch_calls[idx];
         delta.decode_async_slot_barrier_calls[idx] = total.decode_async_slot_barrier_calls[idx] -| prefix.decode_async_slot_barrier_calls[idx];
         delta.decode_async_slot_resource_barrier_resources[idx] = total.decode_async_slot_resource_barrier_resources[idx] -| prefix.decode_async_slot_resource_barrier_resources[idx];
+        delta.decode_async_slot_completed_cmds[idx] = total.decode_async_slot_completed_cmds[idx] -| prefix.decode_async_slot_completed_cmds[idx];
+        delta.decode_async_slot_gpu_ns[idx] = total.decode_async_slot_gpu_ns[idx] -| prefix.decode_async_slot_gpu_ns[idx];
     }
     delta.sample_ns = total.sample_ns -| prefix.sample_ns;
     delta.total_step_ns = total.total_step_ns -| prefix.total_step_ns;
@@ -2448,16 +2452,18 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
         const submits = profile.decode_async_slot_submits[slot];
         if (submits == 0) continue;
         if (!emitted_header) {
-            log.info("  {s} async decode chunk slots: slot submits avg_dispatch avg_barriers avg_resource_entries", .{label});
+            log.info("  {s} async decode chunk slots: slot submits avg_dispatch avg_barriers avg_resource_entries avg_gpu_ms", .{label});
             emitted_header = true;
         }
-        log.info("  {s} async decode chunk slot {d}: {d} {d:.1} {d:.1} {d:.1}", .{
+        const completed = profile.decode_async_slot_completed_cmds[slot];
+        log.info("  {s} async decode chunk slot {d}: {d} {d:.1} {d:.1} {d:.1} {d:.3}", .{
             label,
             slot,
             submits,
             avgCount(profile.decode_async_slot_dispatch_calls[slot], submits),
             avgCount(profile.decode_async_slot_barrier_calls[slot], submits),
             avgCount(profile.decode_async_slot_resource_barrier_resources[slot], submits),
+            avgMs(profile.decode_async_slot_gpu_ns[slot], completed),
         });
     }
 }
@@ -22452,6 +22458,18 @@ fn releaseCompletedCommands(cmds: []MetalCommand) void {
     }
 }
 
+fn recordPendingDenseCommandGpuDurations(cmds: []MetalCommand, profile: ?*RuntimeProfile) void {
+    const p = profile orelse return;
+    for (cmds, 0..) |*cmd, idx| {
+        if (cmd.handle == null) continue;
+        const gpu_ns = cmd.gpuDurationNs();
+        if (gpu_ns == 0) continue;
+        const slot = @min(idx, decode_async_profile_slots - 1);
+        p.decode_async_slot_completed_cmds[slot] += 1;
+        p.decode_async_slot_gpu_ns[slot] += gpu_ns;
+    }
+}
+
 fn waitPendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*RuntimeProfile) void {
     const n = count.*;
     if (n == 0) return;
@@ -22465,11 +22483,13 @@ fn waitPendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*Runt
         p.decode_async_queue_pending_cmds += saturatingU32FromUsize(n);
         p.decode_async_queue_wait_ns += wait_ns;
     }
+    recordPendingDenseCommandGpuDurations(cmds[0..n], profile);
     releaseCompletedCommands(cmds[0 .. n - 1]);
     count.* = 0;
 }
 
-fn releasePendingDenseCommands(cmds: []MetalCommand, count: *usize) void {
+fn releasePendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*RuntimeProfile) void {
+    recordPendingDenseCommandGpuDurations(cmds[0..count.*], profile);
     releaseCompletedCommands(cmds[0..count.*]);
     count.* = 0;
 }
@@ -22834,7 +22854,7 @@ fn runDecodeStep(
                 // real barrier on that path, or by command-buffer ordering
                 // across the early/tail prompt split.
                 if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
-                releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
+                releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count, profile);
                 engine.position += 1;
                 return;
             }
@@ -24810,7 +24830,7 @@ fn runDecodeStep(
             commitFinalCommandProfiled(cmd, profile, dense_pending_count);
         }
     }
-    releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
+    releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count, profile);
     if (engine.debug_validation_enabled and engine.position == 5) {
         const debug_start = profileStart(profile != null);
         try debugCompareFinalLogits(engine);
@@ -30913,10 +30933,14 @@ test "profile split preserves SSM and dense tail phase counters" {
     prefix.decode_async_slot_dispatch_calls[0] = 20;
     prefix.decode_async_slot_barrier_calls[0] = 18;
     prefix.decode_async_slot_resource_barrier_resources[0] = 16;
+    prefix.decode_async_slot_completed_cmds[0] = 2;
+    prefix.decode_async_slot_gpu_ns[0] = 2_000_000;
     prefix.decode_async_slot_submits[1] = 3;
     prefix.decode_async_slot_dispatch_calls[1] = 33;
     prefix.decode_async_slot_barrier_calls[1] = 30;
     prefix.decode_async_slot_resource_barrier_resources[1] = 27;
+    prefix.decode_async_slot_completed_cmds[1] = 3;
+    prefix.decode_async_slot_gpu_ns[1] = 6_000_000;
 
     var total = RuntimeProfile{
         .decode_async_submitted_dispatch_calls = 900,
@@ -30960,10 +30984,14 @@ test "profile split preserves SSM and dense tail phase counters" {
     total.decode_async_slot_dispatch_calls[0] = 70;
     total.decode_async_slot_barrier_calls[0] = 63;
     total.decode_async_slot_resource_barrier_resources[0] = 56;
+    total.decode_async_slot_completed_cmds[0] = 7;
+    total.decode_async_slot_gpu_ns[0] = 9_000_000;
     total.decode_async_slot_submits[1] = 11;
     total.decode_async_slot_dispatch_calls[1] = 121;
     total.decode_async_slot_barrier_calls[1] = 110;
     total.decode_async_slot_resource_barrier_resources[1] = 99;
+    total.decode_async_slot_completed_cmds[1] = 11;
+    total.decode_async_slot_gpu_ns[1] = 23_000_000;
 
     const delta = profileDeltaForSplit(total, prefix);
     try std.testing.expectEqual(@as(u32, 810), delta.decode_async_submitted_dispatch_calls);
@@ -30976,10 +31004,14 @@ test "profile split preserves SSM and dense tail phase counters" {
     try std.testing.expectEqual(@as(u32, 50), delta.decode_async_slot_dispatch_calls[0]);
     try std.testing.expectEqual(@as(u32, 45), delta.decode_async_slot_barrier_calls[0]);
     try std.testing.expectEqual(@as(u32, 40), delta.decode_async_slot_resource_barrier_resources[0]);
+    try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_completed_cmds[0]);
+    try std.testing.expectEqual(@as(u64, 7_000_000), delta.decode_async_slot_gpu_ns[0]);
     try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_submits[1]);
     try std.testing.expectEqual(@as(u32, 88), delta.decode_async_slot_dispatch_calls[1]);
     try std.testing.expectEqual(@as(u32, 80), delta.decode_async_slot_barrier_calls[1]);
     try std.testing.expectEqual(@as(u32, 72), delta.decode_async_slot_resource_barrier_resources[1]);
+    try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_completed_cmds[1]);
+    try std.testing.expectEqual(@as(u64, 17_000_000), delta.decode_async_slot_gpu_ns[1]);
     try std.testing.expectEqual(@as(u32, 30), delta.ssm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 10), delta.ssm_proj_norm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 20), delta.ssm_qkv_barrier_calls);
