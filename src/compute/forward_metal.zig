@@ -1028,6 +1028,13 @@ const DenseFfnBarrierPhase = enum(u8) {
     scale,
 };
 
+const DenseFfnTailBarrierVariant = enum(u8) {
+    post_norm_next_norm,
+    residual_next_norm,
+    residual_acc,
+    final_norm,
+};
+
 const DenseGemmaQ4KGeGLUValidationStatus = enum(u8) {
     none,
     ok,
@@ -1128,6 +1135,10 @@ pub const RuntimeProfile = struct {
     dense_ffn_down_dispatch_calls: u32 = 0,
     dense_ffn_tail_dispatch_calls: u32 = 0,
     dense_ffn_scale_dispatch_calls: u32 = 0,
+    dense_ffn_tail_post_norm_next_norm_barrier_calls: u32 = 0,
+    dense_ffn_tail_residual_next_norm_barrier_calls: u32 = 0,
+    dense_ffn_tail_residual_acc_barrier_calls: u32 = 0,
+    dense_ffn_tail_final_norm_barrier_calls: u32 = 0,
     dense_ffn_tail_post_norm_dispatch_calls: u32 = 0,
     dense_ffn_tail_post_norm_next_norm_calls: u32 = 0,
     dense_ffn_tail_residual_next_norm_calls: u32 = 0,
@@ -1485,6 +1496,15 @@ fn recordDenseFfnBarrierPhase(profile: ?*RuntimeProfile, phase: DenseFfnBarrierP
     }
 }
 
+fn recordDenseFfnTailBarrierVariant(profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant) void {
+    if (profile) |p| switch (variant) {
+        .post_norm_next_norm => p.dense_ffn_tail_post_norm_next_norm_barrier_calls += 1,
+        .residual_next_norm => p.dense_ffn_tail_residual_next_norm_barrier_calls += 1,
+        .residual_acc => p.dense_ffn_tail_residual_acc_barrier_calls += 1,
+        .final_norm => p.dense_ffn_tail_final_norm_barrier_calls += 1,
+    };
+}
+
 fn recordDenseFfnDispatchDelta(profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase, before: u32, after: u32) void {
     const delta = after -| before;
     if (delta == 0) return;
@@ -1510,6 +1530,22 @@ fn profileDenseFfnBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, 
     cmd.barrierBuffers(bufs);
     if (cmd.barrier_count == before_count) return;
     recordDenseFfnBarrierPhase(profile, phase);
+}
+
+fn profileDenseFfnTailBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant) void {
+    const before_count = cmd.barrier_count;
+    cmd.barrier();
+    if (cmd.barrier_count == before_count) return;
+    recordDenseFfnBarrierPhase(profile, .tail);
+    recordDenseFfnTailBarrierVariant(profile, variant);
+}
+
+fn profileDenseFfnTailBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant, bufs: []const *const MetalBuffer) void {
+    const before_count = cmd.barrier_count;
+    cmd.barrierBuffers(bufs);
+    if (cmd.barrier_count == before_count) return;
+    recordDenseFfnBarrierPhase(profile, .tail);
+    recordDenseFfnTailBarrierVariant(profile, variant);
 }
 
 fn profileFullAttnQkvBarrier(
@@ -1735,6 +1771,10 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.dense_ffn_down_dispatch_calls = total.dense_ffn_down_dispatch_calls -| prefix.dense_ffn_down_dispatch_calls;
     delta.dense_ffn_tail_dispatch_calls = total.dense_ffn_tail_dispatch_calls -| prefix.dense_ffn_tail_dispatch_calls;
     delta.dense_ffn_scale_dispatch_calls = total.dense_ffn_scale_dispatch_calls -| prefix.dense_ffn_scale_dispatch_calls;
+    delta.dense_ffn_tail_post_norm_next_norm_barrier_calls = total.dense_ffn_tail_post_norm_next_norm_barrier_calls -| prefix.dense_ffn_tail_post_norm_next_norm_barrier_calls;
+    delta.dense_ffn_tail_residual_next_norm_barrier_calls = total.dense_ffn_tail_residual_next_norm_barrier_calls -| prefix.dense_ffn_tail_residual_next_norm_barrier_calls;
+    delta.dense_ffn_tail_residual_acc_barrier_calls = total.dense_ffn_tail_residual_acc_barrier_calls -| prefix.dense_ffn_tail_residual_acc_barrier_calls;
+    delta.dense_ffn_tail_final_norm_barrier_calls = total.dense_ffn_tail_final_norm_barrier_calls -| prefix.dense_ffn_tail_final_norm_barrier_calls;
     delta.dense_ffn_tail_post_norm_dispatch_calls = total.dense_ffn_tail_post_norm_dispatch_calls -| prefix.dense_ffn_tail_post_norm_dispatch_calls;
     delta.dense_ffn_tail_post_norm_next_norm_calls = total.dense_ffn_tail_post_norm_next_norm_calls -| prefix.dense_ffn_tail_post_norm_next_norm_calls;
     delta.dense_ffn_tail_residual_next_norm_calls = total.dense_ffn_tail_residual_next_norm_calls -| prefix.dense_ffn_tail_residual_next_norm_calls;
@@ -2209,6 +2249,20 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.dense_ffn_tail_residual_acc_calls,
             profile.dense_ffn_tail_final_norm_calls,
         });
+        const dense_tail_variant_barriers =
+            profile.dense_ffn_tail_post_norm_next_norm_barrier_calls +
+            profile.dense_ffn_tail_residual_next_norm_barrier_calls +
+            profile.dense_ffn_tail_residual_acc_barrier_calls +
+            profile.dense_ffn_tail_final_norm_barrier_calls;
+        if (dense_tail_variant_barriers > 0) {
+            log.info("  {s} dense tail barriers: post+next-norm {d} residual+next-norm {d} residual-acc {d} final-norm {d}", .{
+                label,
+                profile.dense_ffn_tail_post_norm_next_norm_barrier_calls,
+                profile.dense_ffn_tail_residual_next_norm_barrier_calls,
+                profile.dense_ffn_tail_residual_acc_barrier_calls,
+                profile.dense_ffn_tail_final_norm_barrier_calls,
+            });
+        }
     }
 }
 
@@ -8318,6 +8372,19 @@ pub const InferenceEngine = struct {
                     profile.dense_ffn_scale_barrier_calls,
                     other_dense_barriers,
                 });
+                const dense_tail_variant_barriers =
+                    profile.dense_ffn_tail_post_norm_next_norm_barrier_calls +
+                    profile.dense_ffn_tail_residual_next_norm_barrier_calls +
+                    profile.dense_ffn_tail_residual_acc_barrier_calls +
+                    profile.dense_ffn_tail_final_norm_barrier_calls;
+                if (dense_tail_variant_barriers > 0) {
+                    log.info("  dense tail barriers/request: post+next-norm {d} residual+next-norm {d} residual-acc {d} final-norm {d}", .{
+                        profile.dense_ffn_tail_post_norm_next_norm_barrier_calls,
+                        profile.dense_ffn_tail_residual_next_norm_barrier_calls,
+                        profile.dense_ffn_tail_residual_acc_barrier_calls,
+                        profile.dense_ffn_tail_final_norm_barrier_calls,
+                    });
+                }
             }
             if (isDenseGemma31Q4KGeGLUShape(self.config) or profile.dense_gemma_q4k_geglu_validation_checks > 0) {
                 log.info("  dense Gemma Q4_K GeGLU fast: prefix_layers {d} validation_checks {d} status {s} token {d} scan_token {d}/{d} layer {d} tensor {s} max_abs {d:.6} rms {d:.6} tol {d:.6} suggested_safe_prefix {d}", .{
@@ -24121,15 +24188,15 @@ fn runDecodeStep(
                     if (can_fold_layer_scale_here) layer_output_scale_fused_into_post_norm = true;
                     if (can_fuse_final_norm_tail) {
                         if (prefer_dense_gemma_scope_norm_join) {
-                            profileDenseFfnBarrier(cmd, profile, .tail);
+                            profileDenseFfnTailBarrier(cmd, profile, .final_norm);
                         } else {
-                            profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
+                            profileDenseFfnTailBarrierBuffers(cmd, profile, .final_norm, &.{&engine.norm_buf});
                         }
                     } else if (!ends_dense_cmd_chunk) {
                         if (prefer_dense_gemma_scope_norm_join) {
-                            profileDenseFfnBarrier(cmd, profile, .tail);
+                            profileDenseFfnTailBarrier(cmd, profile, .post_norm_next_norm);
                         } else {
-                            profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
+                            profileDenseFfnTailBarrierBuffers(cmd, profile, .post_norm_next_norm, &.{&engine.norm_buf});
                         }
                         prev_fused_hidden_barrier_deferred = true;
                     }
@@ -24162,10 +24229,10 @@ fn runDecodeStep(
                             if (layer_scale_runs_after_dense) layer_output_scale_fused_into_post_norm = true;
                             if (!ends_dense_cmd_chunk) {
                                 if (prefer_dense_gemma_scope_norm_join) {
-                                    profileDenseFfnBarrier(cmd, profile, .tail);
+                                    profileDenseFfnTailBarrier(cmd, profile, .residual_next_norm);
                                     prev_fused_hidden_barrier_deferred = true;
                                 } else {
-                                    profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.norm_buf});
+                                    profileDenseFfnTailBarrierBuffers(cmd, profile, .residual_next_norm, &.{&engine.norm_buf});
                                     prev_fused_hidden_barrier_deferred = true;
                                 }
                             }
@@ -24178,7 +24245,7 @@ fn runDecodeStep(
                             cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
                             if (profile) |p| p.dense_ffn_tail_residual_acc_calls += 1;
                             if (!ends_dense_cmd_chunk or layer_scale_runs_after_dense) {
-                                profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.hidden_buf});
+                                profileDenseFfnTailBarrierBuffers(cmd, profile, .residual_acc, &.{&engine.hidden_buf});
                             }
                         }
                     }
@@ -30421,11 +30488,15 @@ test "profile split preserves SSM and dense tail phase counters" {
         .ssm_gated_norm_barrier_calls = 6,
         .ssm_out_barrier_calls = 7,
         .ssm_residual_barrier_calls = 8,
-        .dense_ffn_tail_post_norm_dispatch_calls = 9,
-        .dense_ffn_tail_post_norm_next_norm_calls = 10,
-        .dense_ffn_tail_residual_next_norm_calls = 11,
-        .dense_ffn_tail_residual_acc_calls = 12,
-        .dense_ffn_tail_final_norm_calls = 13,
+        .dense_ffn_tail_post_norm_next_norm_barrier_calls = 9,
+        .dense_ffn_tail_residual_next_norm_barrier_calls = 10,
+        .dense_ffn_tail_residual_acc_barrier_calls = 11,
+        .dense_ffn_tail_final_norm_barrier_calls = 12,
+        .dense_ffn_tail_post_norm_dispatch_calls = 13,
+        .dense_ffn_tail_post_norm_next_norm_calls = 14,
+        .dense_ffn_tail_residual_next_norm_calls = 15,
+        .dense_ffn_tail_residual_acc_calls = 16,
+        .dense_ffn_tail_final_norm_calls = 17,
     };
     const total = RuntimeProfile{
         .ssm_barrier_calls = 41,
@@ -30437,11 +30508,15 @@ test "profile split preserves SSM and dense tail phase counters" {
         .ssm_gated_norm_barrier_calls = 66,
         .ssm_out_barrier_calls = 77,
         .ssm_residual_barrier_calls = 88,
-        .dense_ffn_tail_post_norm_dispatch_calls = 99,
-        .dense_ffn_tail_post_norm_next_norm_calls = 110,
-        .dense_ffn_tail_residual_next_norm_calls = 121,
-        .dense_ffn_tail_residual_acc_calls = 132,
-        .dense_ffn_tail_final_norm_calls = 143,
+        .dense_ffn_tail_post_norm_next_norm_barrier_calls = 99,
+        .dense_ffn_tail_residual_next_norm_barrier_calls = 110,
+        .dense_ffn_tail_residual_acc_barrier_calls = 121,
+        .dense_ffn_tail_final_norm_barrier_calls = 132,
+        .dense_ffn_tail_post_norm_dispatch_calls = 143,
+        .dense_ffn_tail_post_norm_next_norm_calls = 154,
+        .dense_ffn_tail_residual_next_norm_calls = 165,
+        .dense_ffn_tail_residual_acc_calls = 176,
+        .dense_ffn_tail_final_norm_calls = 187,
     };
 
     const delta = profileDeltaForSplit(total, prefix);
@@ -30454,11 +30529,15 @@ test "profile split preserves SSM and dense tail phase counters" {
     try std.testing.expectEqual(@as(u32, 60), delta.ssm_gated_norm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 70), delta.ssm_out_barrier_calls);
     try std.testing.expectEqual(@as(u32, 80), delta.ssm_residual_barrier_calls);
-    try std.testing.expectEqual(@as(u32, 90), delta.dense_ffn_tail_post_norm_dispatch_calls);
-    try std.testing.expectEqual(@as(u32, 100), delta.dense_ffn_tail_post_norm_next_norm_calls);
-    try std.testing.expectEqual(@as(u32, 110), delta.dense_ffn_tail_residual_next_norm_calls);
-    try std.testing.expectEqual(@as(u32, 120), delta.dense_ffn_tail_residual_acc_calls);
-    try std.testing.expectEqual(@as(u32, 130), delta.dense_ffn_tail_final_norm_calls);
+    try std.testing.expectEqual(@as(u32, 90), delta.dense_ffn_tail_post_norm_next_norm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 100), delta.dense_ffn_tail_residual_next_norm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 110), delta.dense_ffn_tail_residual_acc_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 120), delta.dense_ffn_tail_final_norm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 130), delta.dense_ffn_tail_post_norm_dispatch_calls);
+    try std.testing.expectEqual(@as(u32, 140), delta.dense_ffn_tail_post_norm_next_norm_calls);
+    try std.testing.expectEqual(@as(u32, 150), delta.dense_ffn_tail_residual_next_norm_calls);
+    try std.testing.expectEqual(@as(u32, 160), delta.dense_ffn_tail_residual_acc_calls);
+    try std.testing.expectEqual(@as(u32, 170), delta.dense_ffn_tail_final_norm_calls);
 }
 
 test "q8 lm head stays on GPU" {
