@@ -1,7 +1,51 @@
-# llama.cpp Vulkan Backend Analysis
+# llama.cpp Backend Analysis
 
-Analysis of llama.cpp's Vulkan backend to understand current RDNA4 inference performance
-and identify opportunities for a purpose-built engine.
+Analysis of llama.cpp backends to understand current inference performance and
+identify opportunities for a purpose-built engine.
+
+## Metal Qwen3.6 27B Dense-Hybrid Decode Stall - 2026-06-13
+
+Effort 24 is past the point where local Q4/Q6 retunes are useful. The current
+Qwen3.6 27B dense-hybrid M4 profile is correct but flat around 14.7 tok/s live
+and 15.09 tok/s best-kept. The slowest async decode slot reports about 1.88
+GiB/token at 215.7 GiB/s effective bandwidth, with dense FFN bytes dominating:
+gate 19.9%, up 19.9%, down 29.0% of the slowest slot. The remaining gap is
+not a dispatch-count problem by itself; cycle 81 reduced dense gate/up dispatch
+count and stayed flat, while cycles 82-93 reverted local shader, barrier, SSM,
+LM-head, and copied-arena variants.
+
+Reference pass:
+
+- llama.cpp `ggml_metal_graph_compute` in
+  `ggml/src/ggml-metal/ggml-metal-context.m` keeps graph work queued in a small
+  command-buffer set, uses `commandBufferWithUnretainedReferences`, enqueues
+  command buffers, and usually waits at graph/token boundaries rather than
+  after every op.
+- llama.cpp `ggml_metal_op_encode_impl` plus
+  `ggml_metal_op_concurrency_check/reset` in
+  `ggml/src/ggml-metal/ggml-metal-ops.cpp` tracks source/destination memory
+  ranges and resets the encoder only when the next op conflicts with tracked
+  ranges. That maps to ZINC's already-kept resource-edge barriers for Qwen27
+  dense gate/up and activation joins.
+- llama.cpp `ggml_metal_op_mul_mat` keeps single-token decode on mat-vec
+  kernels; it does not turn this dense-hybrid decode case into a batched GEMM
+  problem.
+- llama.cpp `kernel_mul_mv_q4_K_f32_impl` and
+  `kernel_mul_mv_q6_K_f32_impl` in `ggml-metal.metal` use row-pair/simdgroup
+  mat-vec discipline. ZINC has already adapted the profitable subset via the
+  exact Qwen27 Q6 dense-down route and exact Q4 gate/up QK-dual route.
+- vLLM `fused_moe` aligns and packs routed expert tokens into grouped expert
+  blocks after top-k. Qwen3.6 27B dense-hybrid has no routed MoE, so this does
+  not apply to the Effort 24 decode hot path.
+
+Decision for the next Effort 24 source cycle: do not spend another edit on
+`dmmv_q4k_qk_dual`, `dmmv_q6k_llama`, SSM projection pairing, dense-down
+materialization, final/logits tail, or command-buffer grouping unless the cycle
+first brings fresh exact-shape evidence showing that path can beat the 15.09
+tok/s promotion band. The useful next work is outside the runtime loop: run the
+full public M4 suite on the kept tree, or collect exact Metal shape data that
+separates dense Q4 gate/up, Q6 down, and the small SSM buckets before making a
+default-on production change.
 
 ## Architecture Detection
 
