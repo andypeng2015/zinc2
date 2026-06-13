@@ -699,6 +699,28 @@ fn denseGemmaQ4KGeGLUValidationRequested(cfg: ModelConfig) bool {
         qwenRoutePackedFullValidationBisectEnabled();
 }
 
+fn qwen35DenseQ4KSwiGLUValidationRequested(cfg: ModelConfig) bool {
+    if (!defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) return false;
+    return (readBoolEnv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE") orelse false) or
+        (readBoolEnv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE") orelse false) or
+        std.posix.getenv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_LAYER") != null or
+        std.posix.getenv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_LAYER") != null;
+}
+
+fn qwen35DenseQ4KSwiGLUValidateLayer(engine: *const InferenceEngine) usize {
+    const requested =
+        readU32Env("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_LAYER") orelse
+        readU32Env("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_LAYER") orelse
+        0;
+    if (engine.config.n_layers == 0) return 0;
+    return @min(@as(usize, @intCast(requested)), @as(usize, @intCast(engine.config.n_layers - 1)));
+}
+
+fn qwen35DenseQ4KSwiGLUValidateToken() ?u32 {
+    return readU32Env("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN") orelse
+        readU32Env("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_TOKEN");
+}
+
 fn denseGemmaQ4KGeGLUValidateLayer(engine: *const InferenceEngine) usize {
     const default_layer = if (engine.profile_enabled and
         isDenseGemma31Q4KGeGLUShape(engine.config) and
@@ -5755,6 +5777,8 @@ pub const InferenceEngine = struct {
     dense_gemma_q4k_geglu_validation_emitted: bool,
     dense_gemma_q4k_geglu_validation_scanned_tokens: u32,
     dense_gemma_q4k_geglu_validation_token_limit: u32,
+    qwen35_dense_q4k_swiglu_validation_enabled: bool,
+    qwen35_dense_q4k_swiglu_validation_emitted: bool,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     lm_head_argmax_cpu_reduce_pairs: u32,
@@ -5934,6 +5958,11 @@ pub const InferenceEngine = struct {
         if (dense_gemma_q4k_geglu_profile_scan) {
             log.info("Metal profile: dense Gemma31 Q4_K GeGLU validator layer-mask scan enabled at layer {d}; set ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN=0 to skip or ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_SCAN=1 for first-failure scan", .{denseGemmaQ4KGeGLUValidateLayer(&self)});
         }
+        self.qwen35_dense_q4k_swiglu_validation_enabled = qwen35DenseQ4KSwiGLUValidationRequested(cfg);
+        self.qwen35_dense_q4k_swiglu_validation_emitted = false;
+        if (self.qwen35_dense_q4k_swiglu_validation_enabled) {
+            log.info("Metal validation: Qwen3.6 27B dense Q4_K gate/up+SwiGLU validator enabled at layer {d}; optional token filter ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN", .{qwen35DenseQ4KSwiGLUValidateLayer(&self)});
+        }
         self.in_prefill_phase = false;
         self.dense_gemma_wide_post_norm_prefill_enabled =
             readBoolEnv("ZINC_METAL_DENSE_GEMMA_WIDE_POST_NORM_PREFILL") orelse false;
@@ -5961,7 +5990,8 @@ pub const InferenceEngine = struct {
         self.private_decode_buffers = if (options.debug_validation_enabled or
             self.gemma_moe_validation_enabled or
             self.qwen_prefill_validation_enabled or
-            self.dense_gemma_q4k_geglu_validation_enabled)
+            self.dense_gemma_q4k_geglu_validation_enabled or
+            self.qwen35_dense_q4k_swiglu_validation_enabled)
             false
         else
             options.private_decode_buffers_override orelse
@@ -7549,6 +7579,7 @@ pub const InferenceEngine = struct {
         self.qwen_moe_route_validate_failure_hint_emitted = false;
         self.dense_gemma_q4k_geglu_validation_emitted = false;
         self.dense_gemma_q4k_geglu_validation_scanned_tokens = 0;
+        self.qwen35_dense_q4k_swiglu_validation_emitted = false;
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -11211,6 +11242,45 @@ fn canUseDenseQ4KGateUpSwiGLU(
         engine.dmmv_q4k_dense_gate_up_swiglu_pipe.max_threads_per_threadgroup >= 64;
 }
 
+fn isQwen35DenseQ4KGateUpSwiGLUTarget(
+    cfg: ModelConfig,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    return defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg) and
+        !usesGeglu(cfg) and
+        gate.info.type_ == .q4_k and
+        up.info.type_ == .q4_k and
+        isQwen35DenseGateUpQ4kTarget(cfg, gate.info.name, M, K) and
+        isQwen35DenseGateUpQ4kTarget(cfg, up.info.name, M, K);
+}
+
+fn shouldValidateQwen35DenseQ4KGateUpSwiGLU(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    if (!engine.qwen35_dense_q4k_swiglu_validation_enabled) return false;
+    if (engine.qwen35_dense_q4k_swiglu_validation_emitted) return false;
+    if (engine.in_prefill_phase) return false;
+    if (engine.private_decode_buffers) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (layer_idx != qwen35DenseQ4KSwiGLUValidateLayer(engine)) return false;
+    if (qwen35DenseQ4KSwiGLUValidateToken()) |token| {
+        if (engine.position != token) return false;
+    }
+    if (!isQwen35DenseQ4KGateUpSwiGLUTarget(engine.config, gate, up, M, K)) return false;
+    return engine.dmmv_q4k_dense_gate_up_swiglu_pipe.handle != null and
+        engine.dmmv_q4k_dense_gate_up_swiglu_pipe.max_threads_per_threadgroup >= 64 and
+        engine.swiglu_buf.cpu_ptr != null and
+        engine.down_buf.cpu_ptr != null;
+}
+
 fn dispatchDenseQ4KGateUpSwiGLUOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
@@ -11245,6 +11315,83 @@ fn dispatchDenseQ4KGateUpSwiGLUOnCmd(
         @sizeOf(DualQ8DmmvPush),
         2,
     );
+}
+
+fn validateQwen35DenseQ4KGateUpSwiGLUOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+) !void {
+    // Default-off validator for the Qwen3.6 27B dense FFN fusion that cycle 3
+    // rejected on throughput. It mirrors llama.cpp's fused op validation
+    // discipline: run the candidate next to the production reference, commit
+    // once, compare the materialized activation row, then resume the normal
+    // command stream with production buffers intact.
+    const push = DualQ8DmmvPush{
+        .M0 = M,
+        .M1 = M,
+        .K = K,
+        .a0_offset = tensorPageOffset(engine.model, gate),
+        .a1_offset = tensorPageOffset(engine.model, up),
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate.gpu_buffer, &up.gpu_buffer, input_buf, &engine.down_buf };
+    const rows_per_wg: u32 = 4;
+    cmd.dispatchV2(
+        &engine.dmmv_q4k_dense_gate_up_swiglu_pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, 1, 1 },
+        .{ 64, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(DualQ8DmmvPush),
+        2,
+    );
+    commitAndWaitProfiled(cmd, profile);
+
+    const ref_ptr: [*]const f32 = @ptrCast(@alignCast(engine.swiglu_buf.cpu_ptr.?));
+    const candidate_ptr: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
+    const ref_slice = ref_ptr[0..M];
+    const candidate_slice = candidate_ptr[0..M];
+    const diff = diffF32Slices(ref_slice, candidate_slice);
+    const ref_value = if (M > 0) ref_slice[diff.max_idx] else 0.0;
+    const candidate_value = if (M > 0) candidate_slice[diff.max_idx] else 0.0;
+    const tol: f32 = 5e-2;
+    const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
+    if (diff.max_abs <= tol) {
+        log.info("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE[{s}]: token={d} layer={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} flag_on=ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE=1", .{
+            verdict,
+            engine.position,
+            layer_idx,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    } else {
+        log.warn("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE[{s}]: token={d} layer={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} flag_on=ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE=1", .{
+            verdict,
+            engine.position,
+            layer_idx,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    }
+    engine.qwen35_dense_q4k_swiglu_validation_emitted = true;
+    cmd.* = try beginProfiledCommand(engine, profile);
 }
 
 fn dispatchDualQ8DmmvOnCmd(
@@ -25115,6 +25262,9 @@ fn runDecodeStep(
                     const activation_dispatch_before = cmd.dispatch_count;
                     dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, inter_dim);
                     recordDenseFfnDispatchDelta(profile, .activation, activation_dispatch_before, cmd.dispatch_count);
+                    if (shouldValidateQwen35DenseQ4KGateUpSwiGLU(engine, layer_idx, gate_t, up_t, inter_dim, hidden_dim)) {
+                        try validateQwen35DenseQ4KGateUpSwiGLUOnCmd(engine, cmd, profile, layer_idx, gate_t, up_t, &engine.norm_buf, inter_dim, hidden_dim);
+                    }
                 }
                 // Dense-down consumes only the activation row, and no
                 // independent dense work remains queued at this edge. Match
@@ -31427,6 +31577,23 @@ test "q6k simdgroup route covers qwen35 27b exact shapes" {
     try std.testing.expect(isQwen35DenseDownQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
     try std.testing.expect(!isQwen35DenseDownQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_gate.weight", 17408, 5120));
     try std.testing.expect(!isQwen35DenseDownQ4kTarget(qwen35_27b_cfg, "blk.0.ssm_out.weight", 10240, 5120));
+
+    const null_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    const gate = metal_loader.LoadedTensor{
+        .info = .{ .name = "blk.0.ffn_gate.weight", .n_dims = 2, .dims = .{ 5120, 17408, 1, 1 }, .type_ = .q4_k, .offset = 0 },
+        .gpu_buffer = null_buf,
+    };
+    const up = metal_loader.LoadedTensor{
+        .info = .{ .name = "blk.0.ffn_up.weight", .n_dims = 2, .dims = .{ 5120, 17408, 1, 1 }, .type_ = .q4_k, .offset = 0 },
+        .gpu_buffer = null_buf,
+    };
+    const down = metal_loader.LoadedTensor{
+        .info = .{ .name = "blk.0.ffn_down.weight", .n_dims = 2, .dims = .{ 17408, 5120, 1, 1 }, .type_ = .q4_k, .offset = 0 },
+        .gpu_buffer = null_buf,
+    };
+    try std.testing.expect(isQwen35DenseQ4KGateUpSwiGLUTarget(qwen35_27b_cfg, &gate, &up, 17408, 5120));
+    try std.testing.expect(!isQwen35DenseQ4KGateUpSwiGLUTarget(qwen35_27b_cfg, &gate, &down, 17408, 5120));
+    try std.testing.expect(!isQwen35DenseQ4KGateUpSwiGLUTarget(qwen35_27b_cfg, &gate, &up, 17408, 4096));
 }
 
 test "gemma26 prefill shared q8 tg128 only matches shared expert shapes" {
