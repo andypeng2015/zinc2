@@ -1345,6 +1345,16 @@ pub const RuntimeProfile = struct {
     ssm_qkv_projection_bytes: u64 = 0,
     ssm_gate_projection_bytes: u64 = 0,
     ssm_tail_projection_bytes: u64 = 0,
+    ssm_qkv_gate_pair_calls: u32 = 0,
+    ssm_qkv_gate_pair_bytes: u64 = 0,
+    ssm_qkv_gate_pair_q4q4_calls: u32 = 0,
+    ssm_qkv_gate_pair_q4q4_bytes: u64 = 0,
+    ssm_qkv_gate_pair_q6q4_calls: u32 = 0,
+    ssm_qkv_gate_pair_q6q4_bytes: u64 = 0,
+    ssm_qkv_gate_pair_q8q8_calls: u32 = 0,
+    ssm_qkv_gate_pair_q8q8_bytes: u64 = 0,
+    ssm_qkv_gate_pair_other_calls: u32 = 0,
+    ssm_qkv_gate_pair_other_bytes: u64 = 0,
     ssm_out_bytes: u64 = 0,
     full_attn_bytes: u64 = 0,
     full_attn_projection_bytes: u64 = 0,
@@ -2118,6 +2128,16 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.ssm_qkv_projection_bytes = total.ssm_qkv_projection_bytes -| prefix.ssm_qkv_projection_bytes;
     delta.ssm_gate_projection_bytes = total.ssm_gate_projection_bytes -| prefix.ssm_gate_projection_bytes;
     delta.ssm_tail_projection_bytes = total.ssm_tail_projection_bytes -| prefix.ssm_tail_projection_bytes;
+    delta.ssm_qkv_gate_pair_calls = total.ssm_qkv_gate_pair_calls -| prefix.ssm_qkv_gate_pair_calls;
+    delta.ssm_qkv_gate_pair_bytes = total.ssm_qkv_gate_pair_bytes -| prefix.ssm_qkv_gate_pair_bytes;
+    delta.ssm_qkv_gate_pair_q4q4_calls = total.ssm_qkv_gate_pair_q4q4_calls -| prefix.ssm_qkv_gate_pair_q4q4_calls;
+    delta.ssm_qkv_gate_pair_q4q4_bytes = total.ssm_qkv_gate_pair_q4q4_bytes -| prefix.ssm_qkv_gate_pair_q4q4_bytes;
+    delta.ssm_qkv_gate_pair_q6q4_calls = total.ssm_qkv_gate_pair_q6q4_calls -| prefix.ssm_qkv_gate_pair_q6q4_calls;
+    delta.ssm_qkv_gate_pair_q6q4_bytes = total.ssm_qkv_gate_pair_q6q4_bytes -| prefix.ssm_qkv_gate_pair_q6q4_bytes;
+    delta.ssm_qkv_gate_pair_q8q8_calls = total.ssm_qkv_gate_pair_q8q8_calls -| prefix.ssm_qkv_gate_pair_q8q8_calls;
+    delta.ssm_qkv_gate_pair_q8q8_bytes = total.ssm_qkv_gate_pair_q8q8_bytes -| prefix.ssm_qkv_gate_pair_q8q8_bytes;
+    delta.ssm_qkv_gate_pair_other_calls = total.ssm_qkv_gate_pair_other_calls -| prefix.ssm_qkv_gate_pair_other_calls;
+    delta.ssm_qkv_gate_pair_other_bytes = total.ssm_qkv_gate_pair_other_bytes -| prefix.ssm_qkv_gate_pair_other_bytes;
     delta.ssm_out_bytes = total.ssm_out_bytes -| prefix.ssm_out_bytes;
     delta.full_attn_bytes = total.full_attn_bytes -| prefix.full_attn_bytes;
     delta.full_attn_projection_bytes = total.full_attn_projection_bytes -| prefix.full_attn_projection_bytes;
@@ -2229,6 +2249,21 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
         profile.router_topk_calls,
         nsToMs(profile.router_cpu_ns),
     });
+    if (profile.ssm_qkv_gate_pair_calls > 0) {
+        log.info("  {s} ssm qkv+gate pair candidates: calls {d} bytes {d:.2} GiB | q4/q4 {d} {d:.2} GiB q6/q4 {d} {d:.2} GiB q8/q8 {d} {d:.2} GiB other {d} {d:.2} GiB", .{
+            label,
+            profile.ssm_qkv_gate_pair_calls,
+            bytesToGiB(profile.ssm_qkv_gate_pair_bytes),
+            profile.ssm_qkv_gate_pair_q4q4_calls,
+            bytesToGiB(profile.ssm_qkv_gate_pair_q4q4_bytes),
+            profile.ssm_qkv_gate_pair_q6q4_calls,
+            bytesToGiB(profile.ssm_qkv_gate_pair_q6q4_bytes),
+            profile.ssm_qkv_gate_pair_q8q8_calls,
+            bytesToGiB(profile.ssm_qkv_gate_pair_q8q8_bytes),
+            profile.ssm_qkv_gate_pair_other_calls,
+            bytesToGiB(profile.ssm_qkv_gate_pair_other_bytes),
+        });
+    }
     log.info("  {s} buckets: dense ffn total {d:.2} GiB gate {d:.2} GiB up {d:.2} GiB down {d:.2} GiB", .{
         label,
         bytesToGiB(profile.dense_ffn_bytes),
@@ -9861,6 +9896,39 @@ fn recordDetailedDmmvBytes(profile: *RuntimeProfile, detail: DmmvDetailClass, by
         .moe_gate_up => profile.moe_expert_gate_up_bytes += bytes,
         .moe_down => profile.moe_expert_down_bytes += bytes,
         .none => {},
+    }
+}
+
+fn recordSsmQkvGatePairProfile(
+    engine: *InferenceEngine,
+    qkv_t: *const metal_loader.LoadedTensor,
+    gate_t: *const metal_loader.LoadedTensor,
+    qkv_rows: u32,
+    gate_rows: u32,
+    cols: u32,
+) void {
+    if (!engine.profile_enabled) return;
+    if (!defaultQwen35Dense27bSsmDeltaGatedNormEnabled(engine.config)) return;
+
+    const qkv_bytes = dmmvWeightBytes(qkv_t.info.type_, qkv_rows, cols);
+    const gate_bytes = dmmvWeightBytes(gate_t.info.type_, gate_rows, cols);
+    const pair_bytes = qkv_bytes + gate_bytes;
+    var profile = &engine.request_profile;
+    profile.ssm_qkv_gate_pair_calls += 1;
+    profile.ssm_qkv_gate_pair_bytes += pair_bytes;
+
+    if (qkv_t.info.type_ == .q4_k and gate_t.info.type_ == .q4_k) {
+        profile.ssm_qkv_gate_pair_q4q4_calls += 1;
+        profile.ssm_qkv_gate_pair_q4q4_bytes += pair_bytes;
+    } else if (qkv_t.info.type_ == .q6_k and gate_t.info.type_ == .q4_k) {
+        profile.ssm_qkv_gate_pair_q6q4_calls += 1;
+        profile.ssm_qkv_gate_pair_q6q4_bytes += pair_bytes;
+    } else if (qkv_t.info.type_ == .q8_0 and gate_t.info.type_ == .q8_0) {
+        profile.ssm_qkv_gate_pair_q8q8_calls += 1;
+        profile.ssm_qkv_gate_pair_q8q8_bytes += pair_bytes;
+    } else {
+        profile.ssm_qkv_gate_pair_other_calls += 1;
+        profile.ssm_qkv_gate_pair_other_bytes += pair_bytes;
     }
 }
 
@@ -23628,6 +23696,15 @@ fn runDecodeStep(
                 &z_t.gpu_buffer;
             const wqkv_offset: u32 = if (wqkv_buf == &wqkv_t.gpu_buffer) tensorPageOffset(engine.model, wqkv_t) else 0;
             const z_offset: u32 = if (z_buf == &z_t.gpu_buffer) tensorPageOffset(engine.model, z_t) else 0;
+            // Analysis hook for the next structural speed path: llama.cpp's
+            // `ggml_metal_op_mul_mat_id` batches same-input expert work once
+            // the ids are mapped, while vLLM's `moe_align_block_size` shows
+            // that single-token decode only has a small packed workset. For
+            // dense Qwen3.6 27B, the analogous unfused pair is SSM qkv+gate:
+            // same normalized row, adjacent dependency boundary, different
+            // quant types. Quantify exact pair calls/bytes before adding a
+            // mixed Q6_K/Q4_K or Q4_K/Q4_K dual projection kernel.
+            recordSsmQkvGatePairProfile(engine, wqkv_t, z_t, conv_channels, d_inner, hidden_dim);
 
             if (shouldCaptureQwenRoutePackedLayerInput(engine, layer_idx, using_local_cmd)) {
                 try captureQwenRoutePackedLayerInput(engine, hidden_dim);
