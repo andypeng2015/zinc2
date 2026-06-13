@@ -1050,6 +1050,56 @@ const SsmBarrierPhaseCounters = struct {
     }
 };
 
+const DenseFfnBarrierPhase = enum(u8) {
+    norm,
+    gate_up,
+    activation,
+    down,
+    tail,
+    scale,
+};
+
+const DenseFfnBarrierPhaseCounters = struct {
+    norm: u32 = 0,
+    gate_up: u32 = 0,
+    activation: u32 = 0,
+    down: u32 = 0,
+    tail: u32 = 0,
+    scale: u32 = 0,
+
+    fn add(self: *DenseFfnBarrierPhaseCounters, phase: DenseFfnBarrierPhase, value: u32) void {
+        if (value == 0) return;
+        switch (phase) {
+            .norm => self.norm += value,
+            .gate_up => self.gate_up += value,
+            .activation => self.activation += value,
+            .down => self.down += value,
+            .tail => self.tail += value,
+            .scale => self.scale += value,
+        }
+    }
+
+    fn total(self: DenseFfnBarrierPhaseCounters) u32 {
+        return self.norm +
+            self.gate_up +
+            self.activation +
+            self.down +
+            self.tail +
+            self.scale;
+    }
+
+    fn diff(total_counts: DenseFfnBarrierPhaseCounters, prefix_counts: DenseFfnBarrierPhaseCounters) DenseFfnBarrierPhaseCounters {
+        return .{
+            .norm = total_counts.norm -| prefix_counts.norm,
+            .gate_up = total_counts.gate_up -| prefix_counts.gate_up,
+            .activation = total_counts.activation -| prefix_counts.activation,
+            .down = total_counts.down -| prefix_counts.down,
+            .tail = total_counts.tail -| prefix_counts.tail,
+            .scale = total_counts.scale -| prefix_counts.scale,
+        };
+    }
+};
+
 const GpuMoeBarrierPhase = enum(u8) {
     router,
     gate_up,
@@ -1066,15 +1116,6 @@ const FullAttnBarrierPhase = enum(u8) {
     gate,
     out,
     residual,
-};
-
-const DenseFfnBarrierPhase = enum(u8) {
-    norm,
-    gate_up,
-    activation,
-    down,
-    tail,
-    scale,
 };
 
 const DenseFfnTailBarrierVariant = enum(u8) {
@@ -1181,6 +1222,9 @@ pub const RuntimeProfile = struct {
     dense_ffn_down_barrier_calls: u32 = 0,
     dense_ffn_tail_barrier_calls: u32 = 0,
     dense_ffn_scale_barrier_calls: u32 = 0,
+    dense_ffn_scope_barrier_calls_by_phase: DenseFfnBarrierPhaseCounters = .{},
+    dense_ffn_resource_barrier_calls_by_phase: DenseFfnBarrierPhaseCounters = .{},
+    dense_ffn_resource_barrier_resources_by_phase: DenseFfnBarrierPhaseCounters = .{},
     dense_ffn_norm_dispatch_calls: u32 = 0,
     dense_ffn_gate_up_dispatch_calls: u32 = 0,
     dense_ffn_activation_dispatch_calls: u32 = 0,
@@ -1620,34 +1664,88 @@ fn recordDenseFfnDispatchDelta(profile: ?*RuntimeProfile, phase: DenseFfnBarrier
     };
 }
 
+fn recordDenseFfnBarrierKind(
+    profile: ?*RuntimeProfile,
+    phase: DenseFfnBarrierPhase,
+    scope_delta: u32,
+    resource_delta: u32,
+    resource_entries_delta: u32,
+) void {
+    if (profile) |p| {
+        p.dense_ffn_scope_barrier_calls_by_phase.add(phase, scope_delta);
+        p.dense_ffn_resource_barrier_calls_by_phase.add(phase, resource_delta);
+        p.dense_ffn_resource_barrier_resources_by_phase.add(phase, resource_entries_delta);
+    }
+}
+
 fn profileDenseFfnBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
     cmd.barrier();
     if (cmd.barrier_count == before_count) return;
     recordDenseFfnBarrierPhase(profile, phase);
+    recordDenseFfnBarrierKind(
+        profile,
+        phase,
+        cmd.scope_barrier_count -| before_scope_count,
+        cmd.resource_barrier_count -| before_resource_count,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
 }
 
 fn profileDenseFfnBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase, bufs: []const *const MetalBuffer) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
     cmd.barrierBuffers(bufs);
     if (cmd.barrier_count == before_count) return;
     recordDenseFfnBarrierPhase(profile, phase);
+    recordDenseFfnBarrierKind(
+        profile,
+        phase,
+        cmd.scope_barrier_count -| before_scope_count,
+        cmd.resource_barrier_count -| before_resource_count,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
 }
 
 fn profileDenseFfnTailBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
     cmd.barrier();
     if (cmd.barrier_count == before_count) return;
     recordDenseFfnBarrierPhase(profile, .tail);
     recordDenseFfnTailBarrierVariant(profile, variant);
+    recordDenseFfnBarrierKind(
+        profile,
+        .tail,
+        cmd.scope_barrier_count -| before_scope_count,
+        cmd.resource_barrier_count -| before_resource_count,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
 }
 
 fn profileDenseFfnTailBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant, bufs: []const *const MetalBuffer) void {
     const before_count = cmd.barrier_count;
+    const before_scope_count = cmd.scope_barrier_count;
+    const before_resource_count = cmd.resource_barrier_count;
+    const before_resource_entries = cmd.resource_barrier_resources;
     cmd.barrierBuffers(bufs);
     if (cmd.barrier_count == before_count) return;
     recordDenseFfnBarrierPhase(profile, .tail);
     recordDenseFfnTailBarrierVariant(profile, variant);
+    recordDenseFfnBarrierKind(
+        profile,
+        .tail,
+        cmd.scope_barrier_count -| before_scope_count,
+        cmd.resource_barrier_count -| before_resource_count,
+        cmd.resource_barrier_resources -| before_resource_entries,
+    );
 }
 
 fn profileFullAttnQkvBarrier(
@@ -1870,6 +1968,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.dense_ffn_down_barrier_calls = total.dense_ffn_down_barrier_calls -| prefix.dense_ffn_down_barrier_calls;
     delta.dense_ffn_tail_barrier_calls = total.dense_ffn_tail_barrier_calls -| prefix.dense_ffn_tail_barrier_calls;
     delta.dense_ffn_scale_barrier_calls = total.dense_ffn_scale_barrier_calls -| prefix.dense_ffn_scale_barrier_calls;
+    delta.dense_ffn_scope_barrier_calls_by_phase = DenseFfnBarrierPhaseCounters.diff(total.dense_ffn_scope_barrier_calls_by_phase, prefix.dense_ffn_scope_barrier_calls_by_phase);
+    delta.dense_ffn_resource_barrier_calls_by_phase = DenseFfnBarrierPhaseCounters.diff(total.dense_ffn_resource_barrier_calls_by_phase, prefix.dense_ffn_resource_barrier_calls_by_phase);
+    delta.dense_ffn_resource_barrier_resources_by_phase = DenseFfnBarrierPhaseCounters.diff(total.dense_ffn_resource_barrier_resources_by_phase, prefix.dense_ffn_resource_barrier_resources_by_phase);
     delta.dense_ffn_norm_dispatch_calls = total.dense_ffn_norm_dispatch_calls -| prefix.dense_ffn_norm_dispatch_calls;
     delta.dense_ffn_gate_up_dispatch_calls = total.dense_ffn_gate_up_dispatch_calls -| prefix.dense_ffn_gate_up_dispatch_calls;
     delta.dense_ffn_activation_dispatch_calls = total.dense_ffn_activation_dispatch_calls -| prefix.dense_ffn_activation_dispatch_calls;
@@ -2284,6 +2385,45 @@ fn logSsmBarrierKindBreakdown(label: []const u8, profile: RuntimeProfile) void {
     }
 }
 
+fn logDenseFfnBarrierKindBreakdown(label: []const u8, profile: RuntimeProfile) void {
+    const scope = profile.dense_ffn_scope_barrier_calls_by_phase;
+    const resource = profile.dense_ffn_resource_barrier_calls_by_phase;
+    const entries = profile.dense_ffn_resource_barrier_resources_by_phase;
+    if (scope.total() > 0) {
+        log.info("  {s} dense scope barriers: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d}", .{
+            label,
+            scope.norm,
+            scope.gate_up,
+            scope.activation,
+            scope.down,
+            scope.tail,
+            scope.scale,
+        });
+    }
+    if (resource.total() > 0) {
+        log.info("  {s} dense resource barriers: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d}", .{
+            label,
+            resource.norm,
+            resource.gate_up,
+            resource.activation,
+            resource.down,
+            resource.tail,
+            resource.scale,
+        });
+    }
+    if (entries.total() > 0) {
+        log.info("  {s} dense resource barrier entries: norm {d} gate-up {d} activation {d} down {d} tail {d} scale {d}", .{
+            label,
+            entries.norm,
+            entries.gate_up,
+            entries.activation,
+            entries.down,
+            entries.tail,
+            entries.scale,
+        });
+    }
+}
+
 fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
     if (profile.decode_steps > 0) {
         const steps_f = @as(f64, @floatFromInt(profile.decode_steps));
@@ -2419,6 +2559,7 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.dense_ffn_scale_barrier_calls,
             other_dense_barriers,
         });
+        logDenseFfnBarrierKindBreakdown(label, profile);
     }
     const dense_dispatches =
         profile.dense_ffn_norm_dispatch_calls +
@@ -8568,6 +8709,7 @@ pub const InferenceEngine = struct {
                     profile.dense_ffn_scale_barrier_calls,
                     other_dense_barriers,
                 });
+                logDenseFfnBarrierKindBreakdown("request", profile);
                 const dense_tail_variant_barriers =
                     profile.dense_ffn_tail_post_norm_next_norm_barrier_calls +
                     profile.dense_ffn_tail_residual_next_norm_barrier_calls +
