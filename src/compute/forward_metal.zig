@@ -1878,6 +1878,11 @@ fn avgGiB(bytes: u64, count: u32) f64 {
     return bytesToGiB(bytes) / @as(f64, @floatFromInt(count));
 }
 
+fn bytesPerSecondGiB(bytes: u64, ns: u64) f64 {
+    if (bytes == 0 or ns == 0) return 0.0;
+    return bytesToGiB(bytes) * 1_000_000_000.0 / @as(f64, @floatFromInt(ns));
+}
+
 fn avgCount(total: u32, count: u32) f64 {
     if (count == 0) return 0.0;
     return @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(count));
@@ -2478,6 +2483,8 @@ fn logDenseFfnBarrierKindBreakdown(label: []const u8, profile: RuntimeProfile) v
 
 fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void {
     var emitted_header = false;
+    var slowest_slot: ?usize = null;
+    var slowest_gpu_ms: f64 = 0.0;
     for (0..decode_async_profile_slots) |slot| {
         const submits = profile.decode_async_slot_submits[slot];
         if (submits == 0) continue;
@@ -2487,6 +2494,11 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
         }
         const completed = profile.decode_async_slot_completed_cmds[slot];
         const layer_submits = profile.decode_async_slot_layer_range_submits[slot];
+        const gpu_ms = avgMs(profile.decode_async_slot_gpu_ns[slot], completed);
+        if (completed > 0 and gpu_ms >= slowest_gpu_ms) {
+            slowest_slot = slot;
+            slowest_gpu_ms = gpu_ms;
+        }
         log.info("  {s} async decode chunk slot {d}: {d} [{d:.1},{d:.1}) {d:.1}/{d:.1}/{d:.1} {d:.1} {d:.1} {d:.1} {d:.3} {d:.2}/{d:.2}/{d:.2}/{d:.2}", .{
             label,
             slot,
@@ -2504,6 +2516,27 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
             avgGiB(profile.decode_async_slot_ssm_projection_bytes[slot], layer_submits),
             avgGiB(profile.decode_async_slot_ssm_out_bytes[slot], layer_submits),
             avgGiB(profile.decode_async_slot_dense_ffn_bytes[slot], layer_submits),
+        });
+    }
+    if (slowest_slot) |slot| {
+        const submits = profile.decode_async_slot_submits[slot];
+        const layer_submits = profile.decode_async_slot_layer_range_submits[slot];
+        const total_bytes =
+            profile.decode_async_slot_full_attn_bytes[slot] +
+            profile.decode_async_slot_ssm_projection_bytes[slot] +
+            profile.decode_async_slot_ssm_out_bytes[slot] +
+            profile.decode_async_slot_dense_ffn_bytes[slot];
+        log.info("  {s} async decode chunk bottleneck: slowest_slot {d} [{d:.1},{d:.1}) avg_gpu_ms {d:.3} avg_total_GiB {d:.2} eff_GiB/s {d:.1} dense_bytes {d:.1}% dispatch/barriers {d:.1}/{d:.1}", .{
+            label,
+            slot,
+            avgCount64(profile.decode_async_slot_layer_start_sum[slot], layer_submits),
+            avgCount64(profile.decode_async_slot_layer_end_sum[slot], layer_submits),
+            slowest_gpu_ms,
+            avgGiB(total_bytes, layer_submits),
+            bytesPerSecondGiB(total_bytes, profile.decode_async_slot_gpu_ns[slot]),
+            pctOf(total_bytes, profile.decode_async_slot_dense_ffn_bytes[slot]),
+            avgCount(profile.decode_async_slot_dispatch_calls[slot], submits),
+            avgCount(profile.decode_async_slot_barrier_calls[slot], submits),
         });
     }
 }
