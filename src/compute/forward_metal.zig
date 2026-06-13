@@ -1025,6 +1025,17 @@ const SsmBarrierPhaseCounters = struct {
         }
     }
 
+    fn addCounts(self: *SsmBarrierPhaseCounters, counts: SsmBarrierPhaseCounters) void {
+        self.proj_norm += counts.proj_norm;
+        self.qkv += counts.qkv;
+        self.tail += counts.tail;
+        self.conv += counts.conv;
+        self.delta += counts.delta;
+        self.gated_norm += counts.gated_norm;
+        self.out += counts.out;
+        self.residual += counts.residual;
+    }
+
     fn total(self: SsmBarrierPhaseCounters) u32 {
         return self.proj_norm +
             self.qkv +
@@ -1077,6 +1088,15 @@ const DenseFfnBarrierPhaseCounters = struct {
             .tail => self.tail += value,
             .scale => self.scale += value,
         }
+    }
+
+    fn addCounts(self: *DenseFfnBarrierPhaseCounters, counts: DenseFfnBarrierPhaseCounters) void {
+        self.norm += counts.norm;
+        self.gate_up += counts.gate_up;
+        self.activation += counts.activation;
+        self.down += counts.down;
+        self.tail += counts.tail;
+        self.scale += counts.scale;
     }
 
     fn total(self: DenseFfnBarrierPhaseCounters) u32 {
@@ -1303,6 +1323,8 @@ pub const RuntimeProfile = struct {
     decode_async_slot_ssm_projection_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_ssm_out_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_dense_ffn_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_barrier_phases: [decode_async_profile_slots]SsmBarrierPhaseCounters = [_]SsmBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
     sample_ns: u64 = 0,
     total_step_ns: u64 = 0,
     debug_validation_ns: u64 = 0,
@@ -2070,6 +2092,8 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
         delta.decode_async_slot_ssm_projection_bytes[idx] = total.decode_async_slot_ssm_projection_bytes[idx] -| prefix.decode_async_slot_ssm_projection_bytes[idx];
         delta.decode_async_slot_ssm_out_bytes[idx] = total.decode_async_slot_ssm_out_bytes[idx] -| prefix.decode_async_slot_ssm_out_bytes[idx];
         delta.decode_async_slot_dense_ffn_bytes[idx] = total.decode_async_slot_dense_ffn_bytes[idx] -| prefix.decode_async_slot_dense_ffn_bytes[idx];
+        delta.decode_async_slot_ssm_barrier_phases[idx] = SsmBarrierPhaseCounters.diff(total.decode_async_slot_ssm_barrier_phases[idx], prefix.decode_async_slot_ssm_barrier_phases[idx]);
+        delta.decode_async_slot_dense_barrier_phases[idx] = DenseFfnBarrierPhaseCounters.diff(total.decode_async_slot_dense_barrier_phases[idx], prefix.decode_async_slot_dense_barrier_phases[idx]);
     }
     delta.sample_ns = total.sample_ns -| prefix.sample_ns;
     delta.total_step_ns = total.total_step_ns -| prefix.total_step_ns;
@@ -2483,6 +2507,7 @@ fn logDenseFfnBarrierKindBreakdown(label: []const u8, profile: RuntimeProfile) v
 
 fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void {
     var emitted_header = false;
+    var emitted_phase_header = false;
     var slowest_slot: ?usize = null;
     var slowest_gpu_ms: f64 = 0.0;
     for (0..decode_async_profile_slots) |slot| {
@@ -2517,6 +2542,32 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
             avgGiB(profile.decode_async_slot_ssm_out_bytes[slot], layer_submits),
             avgGiB(profile.decode_async_slot_dense_ffn_bytes[slot], layer_submits),
         });
+        const ssm_barriers = profile.decode_async_slot_ssm_barrier_phases[slot];
+        const dense_barriers = profile.decode_async_slot_dense_barrier_phases[slot];
+        if (ssm_barriers.total() > 0 or dense_barriers.total() > 0) {
+            if (!emitted_phase_header) {
+                log.info("  {s} async decode chunk slot barrier phase order: ssm proj-norm/qkv/tail/conv/delta/gated/out/residual | dense norm/gate-up/activation/down/tail/scale", .{label});
+                emitted_phase_header = true;
+            }
+            log.info("  {s} async decode chunk slot {d} barrier phases avg: ssm {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1} dense {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                slot,
+                avgCount(ssm_barriers.proj_norm, submits),
+                avgCount(ssm_barriers.qkv, submits),
+                avgCount(ssm_barriers.tail, submits),
+                avgCount(ssm_barriers.conv, submits),
+                avgCount(ssm_barriers.delta, submits),
+                avgCount(ssm_barriers.gated_norm, submits),
+                avgCount(ssm_barriers.out, submits),
+                avgCount(ssm_barriers.residual, submits),
+                avgCount(dense_barriers.norm, submits),
+                avgCount(dense_barriers.gate_up, submits),
+                avgCount(dense_barriers.activation, submits),
+                avgCount(dense_barriers.down, submits),
+                avgCount(dense_barriers.tail, submits),
+                avgCount(dense_barriers.scale, submits),
+            });
+        }
     }
     if (slowest_slot) |slot| {
         const submits = profile.decode_async_slot_submits[slot];
@@ -22661,12 +22712,56 @@ fn recordDecodeAsyncSlotLayerBytes(
     }
 }
 
+fn ssmBarrierPhaseCountersFromProfile(profile: RuntimeProfile) SsmBarrierPhaseCounters {
+    return .{
+        .proj_norm = profile.ssm_proj_norm_barrier_calls,
+        .qkv = profile.ssm_qkv_barrier_calls,
+        .tail = profile.ssm_tail_barrier_calls,
+        .conv = profile.ssm_conv_barrier_calls,
+        .delta = profile.ssm_delta_barrier_calls,
+        .gated_norm = profile.ssm_gated_norm_barrier_calls,
+        .out = profile.ssm_out_barrier_calls,
+        .residual = profile.ssm_residual_barrier_calls,
+    };
+}
+
+fn denseBarrierPhaseCountersFromProfile(profile: RuntimeProfile) DenseFfnBarrierPhaseCounters {
+    return .{
+        .norm = profile.dense_ffn_norm_barrier_calls,
+        .gate_up = profile.dense_ffn_gate_up_barrier_calls,
+        .activation = profile.dense_ffn_activation_barrier_calls,
+        .down = profile.dense_ffn_down_barrier_calls,
+        .tail = profile.dense_ffn_tail_barrier_calls,
+        .scale = profile.dense_ffn_scale_barrier_calls,
+    };
+}
+
+fn recordDecodeAsyncSlotBarrierPhases(
+    profile: *RuntimeProfile,
+    slot: usize,
+    prefix: RuntimeProfile,
+) void {
+    profile.decode_async_slot_ssm_barrier_phases[slot].addCounts(
+        SsmBarrierPhaseCounters.diff(
+            ssmBarrierPhaseCountersFromProfile(profile.*),
+            ssmBarrierPhaseCountersFromProfile(prefix),
+        ),
+    );
+    profile.decode_async_slot_dense_barrier_phases[slot].addCounts(
+        DenseFfnBarrierPhaseCounters.diff(
+            denseBarrierPhaseCountersFromProfile(profile.*),
+            denseBarrierPhaseCountersFromProfile(prefix),
+        ),
+    );
+}
+
 fn submitPendingDenseCommand(
     cmd: *MetalCommand,
     engine: *const InferenceEngine,
     pending_cmds: []MetalCommand,
     pending_count: *usize,
     profile: ?*RuntimeProfile,
+    profile_prefix: ?*const RuntimeProfile,
     cfg: ModelConfig,
     layer_start: usize,
     layer_end: usize,
@@ -22687,6 +22782,7 @@ fn submitPendingDenseCommand(
         p.decode_async_slot_resource_barrier_resources[slot] += cmd.resource_barrier_resources;
         recordDecodeAsyncSlotLayerRange(p, cfg, slot, layer_start, layer_end);
         recordDecodeAsyncSlotLayerBytes(p, engine, slot, layer_start, layer_end);
+        if (profile_prefix) |prefix| recordDecodeAsyncSlotBarrierPhases(p, slot, prefix.*);
     }
     commitAsyncProfiled(cmd, profile);
     if (profile) |p| {
@@ -22923,12 +23019,14 @@ fn runDecodeStep(
         .barrier_count = 0,
         .barrier_enabled = false,
     };
+    var dense_group_profile_prefix: RuntimeProfile = .{};
     var hybrid_group_cmd_storage = MetalCommand{
         .handle = null,
         .dispatch_count = 0,
         .barrier_count = 0,
         .barrier_enabled = false,
     };
+    var hybrid_group_profile_prefix: RuntimeProfile = .{};
     // Sized to hold one token's worth of async layer command buffers. The
     // use_dense_layer_cmd path submits a few grouped chunks, while the hybrid
     // SSM dense path submits one small layer group at a time. Keep 256 slots so a full
@@ -22972,11 +23070,13 @@ fn runDecodeStep(
             cmd
         else if (use_dense_layer_cmd) blk: {
             if (dense_group_cmd_storage.handle == null) {
+                dense_group_profile_prefix = if (profile) |p| p.* else .{};
                 dense_group_cmd_storage = try beginProfiledCommand(engine, profile);
             }
             break :blk &dense_group_cmd_storage;
         } else if (use_hybrid_layer_cmd) blk: {
             if (hybrid_group_cmd_storage.handle == null) {
+                hybrid_group_profile_prefix = if (profile) |p| p.* else .{};
                 hybrid_group_cmd_storage = try beginProfiledCommand(engine, profile);
             }
             break :blk &hybrid_group_cmd_storage;
@@ -23459,7 +23559,7 @@ fn runDecodeStep(
             }
             if (using_local_cmd) {
                 if (use_async_local_decode)
-                    submitPendingDenseCommand(cmd, engine, dense_pending_cmds[0..], &dense_pending_count, profile, cfg, layer_idx, layer_idx + 1)
+                    submitPendingDenseCommand(cmd, engine, dense_pending_cmds[0..], &dense_pending_count, profile, null, cfg, layer_idx, layer_idx + 1)
                 else
                     commitAndWaitProfiled(cmd, profile);
             }
@@ -24272,7 +24372,7 @@ fn runDecodeStep(
             }
             if (using_local_cmd) {
                 if (use_async_local_decode)
-                    submitPendingDenseCommand(cmd, engine, dense_pending_cmds[0..], &dense_pending_count, profile, cfg, layer_idx, layer_idx + 1)
+                    submitPendingDenseCommand(cmd, engine, dense_pending_cmds[0..], &dense_pending_count, profile, null, cfg, layer_idx, layer_idx + 1)
                 else
                     commitAndWaitProfiled(cmd, profile);
             }
@@ -24847,7 +24947,7 @@ fn runDecodeStep(
                         const acc_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.down_buf };
                         cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
                         if (profile) |p| p.dense_ffn_tail_residual_acc_calls += 1;
-                        submitPendingDenseCommand(cmd, engine, dense_pending_cmds[0..], &dense_pending_count, profile, cfg, layer_idx, layer_idx + 1);
+                        submitPendingDenseCommand(cmd, engine, dense_pending_cmds[0..], &dense_pending_count, profile, null, cfg, layer_idx, layer_idx + 1);
                     } else {
                         commitAndWaitProfiled(cmd, profile);
 
@@ -24890,7 +24990,7 @@ fn runDecodeStep(
             const next_layer = layer_idx + 1;
             if (next_layer == layer_count or next_layer % hybrid_cmd_group_layers == 0) {
                 const chunk_start = decodeAsyncChunkStart(next_layer, start_layer, hybrid_cmd_group_layers);
-                submitPendingDenseCommand(&hybrid_group_cmd_storage, engine, dense_pending_cmds[0..], &dense_pending_count, profile, cfg, chunk_start, next_layer);
+                submitPendingDenseCommand(&hybrid_group_cmd_storage, engine, dense_pending_cmds[0..], &dense_pending_count, profile, &hybrid_group_profile_prefix, cfg, chunk_start, next_layer);
             }
         }
         if (use_dense_layer_cmd and dense_group_cmd_storage.handle != null) {
@@ -24898,7 +24998,7 @@ fn runDecodeStep(
             const keep_terminal_dense_cmd_for_final = emit_logits and shared_cmd == null and next_layer == layer_count;
             if ((next_layer == layer_count or next_layer % dense_cmd_group_layers == 0) and !keep_terminal_dense_cmd_for_final) {
                 const chunk_start = decodeAsyncChunkStart(next_layer, start_layer, dense_cmd_group_layers);
-                submitPendingDenseCommand(&dense_group_cmd_storage, engine, dense_pending_cmds[0..], &dense_pending_count, profile, cfg, chunk_start, next_layer);
+                submitPendingDenseCommand(&dense_group_cmd_storage, engine, dense_pending_cmds[0..], &dense_pending_count, profile, &dense_group_profile_prefix, cfg, chunk_start, next_layer);
             }
         }
     }
