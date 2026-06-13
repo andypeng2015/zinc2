@@ -11067,6 +11067,26 @@ fn canUseDenseQ4KGateUpDual(
         can_use_staged_dual;
 }
 
+fn canUseQwen35DenseQ4KGateUpQKDual(
+    engine: *const InferenceEngine,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    // Keep the rejected dense gate/up `dmmv_q4k_dual` path off. This uses the
+    // newer single-axis Q4 dual-row kernel that is already used for the exact
+    // Qwen3.6 27B SSM Q4/Q4 qkv+gate pair.
+    return !engine.in_prefill_phase and
+        !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        isQwen35DenseQ4KGateUpSwiGLUTarget(engine.config, gate, up, M, K) and
+        (M % 4) == 0 and
+        engine.dmmv_q4k_qk_dual_pipe.handle != null and
+        engine.dmmv_q4k_qk_dual_pipe.max_threads_per_threadgroup >= 64;
+}
+
 /// Pairs the dense Gemma attention Q and K projections (same K, both Q4_K,
 /// distinct M_q and M_k) into one dispatch via `dmmv_q4k_qk_dual.metal`.
 /// The kernel uses a single-axis row layout (rows 0..M_q-1 → Q, rows
@@ -25662,6 +25682,8 @@ fn runDecodeStep(
                     dispatchDenseQ4KGateUpGeGLUOnCmd(engine, cmd, layer_idx, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
                 } else if (fused_gate_up_swiglu) {
                     dispatchDenseQ4KGateUpSwiGLUOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
+                } else if (canUseQwen35DenseQ4KGateUpQKDual(engine, gate_t, up_t, inter_dim, hidden_dim)) {
+                    dispatchDenseQ4KQKDualOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.gate_buf, &engine.up_buf, inter_dim, inter_dim, hidden_dim);
                 } else if (canUseDenseQ4KGateUpDual(engine, gate_t, up_t, inter_dim, hidden_dim)) {
                     dispatchDenseQ4KGateUpDualOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.gate_buf, &engine.up_buf, inter_dim, hidden_dim);
                 } else {
