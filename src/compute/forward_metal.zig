@@ -23739,12 +23739,20 @@ fn runDecodeStep(
                 dispatchDmmvOnCmd(engine, cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
                 recordDenseFfnDispatchDelta(profile, .down, down_dispatch_before, cmd.dispatch_count);
                 if (layer_shared_cmd != null) {
-                    // The post-FFN residual reads both down_buf and hidden_buf.
-                    // hidden_buf was intentionally not fenced at the dense FFN input
-                    // edge above because gate/up and down do not consume it. This is
-                    // now the actual join, so mirror llama.cpp's reset barrier rather
-                    // than paying a two-resource barrier on every dense layer.
-                    profileDenseFfnBarrier(cmd, profile, .down);
+                    // Qwen3.6 27B hybrid decode keeps one command buffer per
+                    // layer. The following tail only joins the deferred
+                    // residual write with dense-down output, so fence those
+                    // two resources instead of every prior buffer write.
+                    if (use_hybrid_layer_cmd and defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+                        profileDenseFfnBarrierBuffers(cmd, profile, .down, &.{ &engine.hidden_buf, &engine.down_buf });
+                    } else {
+                        // The post-FFN residual reads both down_buf and hidden_buf.
+                        // hidden_buf was intentionally not fenced at the dense FFN input
+                        // edge above because gate/up and down do not consume it. This is
+                        // now the actual join, so mirror llama.cpp's reset barrier rather
+                        // than paying a two-resource barrier on every dense layer.
+                        profileDenseFfnBarrier(cmd, profile, .down);
+                    }
                 } else {
                     profileDenseFfnBarrierBuffers(cmd, profile, .down, &.{&engine.down_buf});
                 }
