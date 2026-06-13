@@ -1321,6 +1321,9 @@ pub const RuntimeProfile = struct {
     decode_async_slot_dense_ffn_layers: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
     decode_async_slot_full_attn_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_ssm_projection_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_qkv_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_gate_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_ssm_tail_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_ssm_out_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_dense_ffn_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_dense_gate_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
@@ -2103,6 +2106,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
         delta.decode_async_slot_dense_ffn_layers[idx] = total.decode_async_slot_dense_ffn_layers[idx] -| prefix.decode_async_slot_dense_ffn_layers[idx];
         delta.decode_async_slot_full_attn_bytes[idx] = total.decode_async_slot_full_attn_bytes[idx] -| prefix.decode_async_slot_full_attn_bytes[idx];
         delta.decode_async_slot_ssm_projection_bytes[idx] = total.decode_async_slot_ssm_projection_bytes[idx] -| prefix.decode_async_slot_ssm_projection_bytes[idx];
+        delta.decode_async_slot_ssm_qkv_bytes[idx] = total.decode_async_slot_ssm_qkv_bytes[idx] -| prefix.decode_async_slot_ssm_qkv_bytes[idx];
+        delta.decode_async_slot_ssm_gate_bytes[idx] = total.decode_async_slot_ssm_gate_bytes[idx] -| prefix.decode_async_slot_ssm_gate_bytes[idx];
+        delta.decode_async_slot_ssm_tail_bytes[idx] = total.decode_async_slot_ssm_tail_bytes[idx] -| prefix.decode_async_slot_ssm_tail_bytes[idx];
         delta.decode_async_slot_ssm_out_bytes[idx] = total.decode_async_slot_ssm_out_bytes[idx] -| prefix.decode_async_slot_ssm_out_bytes[idx];
         delta.decode_async_slot_dense_ffn_bytes[idx] = total.decode_async_slot_dense_ffn_bytes[idx] -| prefix.decode_async_slot_dense_ffn_bytes[idx];
         delta.decode_async_slot_dense_gate_bytes[idx] = total.decode_async_slot_dense_gate_bytes[idx] -| prefix.decode_async_slot_dense_gate_bytes[idx];
@@ -2584,6 +2590,25 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
             avgGiB(profile.decode_async_slot_ssm_out_bytes[slot], layer_submits),
             avgGiB(profile.decode_async_slot_dense_ffn_bytes[slot], layer_submits),
         });
+        const slot_total_bytes =
+            profile.decode_async_slot_full_attn_bytes[slot] +
+            profile.decode_async_slot_ssm_projection_bytes[slot] +
+            profile.decode_async_slot_ssm_out_bytes[slot] +
+            profile.decode_async_slot_dense_ffn_bytes[slot];
+        if (profile.decode_async_slot_ssm_projection_bytes[slot] > 0) {
+            log.info("  {s} async decode chunk slot {d} ssm bytes avg: qkv/gate/tail/out {d:.2}/{d:.2}/{d:.2}/{d:.2} GiB pct_slot_total {d:.1}/{d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                slot,
+                avgGiB(profile.decode_async_slot_ssm_qkv_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_gate_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_tail_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_out_bytes[slot], layer_submits),
+                pctOf(slot_total_bytes, profile.decode_async_slot_ssm_qkv_bytes[slot]),
+                pctOf(slot_total_bytes, profile.decode_async_slot_ssm_gate_bytes[slot]),
+                pctOf(slot_total_bytes, profile.decode_async_slot_ssm_tail_bytes[slot]),
+                pctOf(slot_total_bytes, profile.decode_async_slot_ssm_out_bytes[slot]),
+            });
+        }
         if (profile.decode_async_slot_dense_ffn_bytes[slot] > 0) {
             if (!emitted_dense_header) {
                 log.info("  {s} async decode chunk slot dense byte order: gate/up/down", .{label});
@@ -2656,6 +2681,19 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
                 pctOf(total_bytes, profile.decode_async_slot_dense_gate_bytes[slot]),
                 pctOf(total_bytes, profile.decode_async_slot_dense_up_bytes[slot]),
                 pctOf(total_bytes, profile.decode_async_slot_dense_down_bytes[slot]),
+            });
+        }
+        if (profile.decode_async_slot_ssm_projection_bytes[slot] > 0 or profile.decode_async_slot_ssm_out_bytes[slot] > 0) {
+            log.info("  {s} async decode chunk bottleneck ssm split: qkv/gate/tail/out {d:.2}/{d:.2}/{d:.2}/{d:.2} GiB pct_total {d:.1}/{d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                avgGiB(profile.decode_async_slot_ssm_qkv_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_gate_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_tail_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_ssm_out_bytes[slot], layer_submits),
+                pctOf(total_bytes, profile.decode_async_slot_ssm_qkv_bytes[slot]),
+                pctOf(total_bytes, profile.decode_async_slot_ssm_gate_bytes[slot]),
+                pctOf(total_bytes, profile.decode_async_slot_ssm_tail_bytes[slot]),
+                pctOf(total_bytes, profile.decode_async_slot_ssm_out_bytes[slot]),
             });
         }
     }
@@ -22797,11 +22835,15 @@ fn recordDecodeAsyncSlotLayerBytes(
             bytes += tensorDmmvBytesForCols(lt.attn_output, q_dim);
             profile.decode_async_slot_full_attn_bytes[slot] += bytes;
         } else if (cfg.ssm_d_inner != 0) {
-            profile.decode_async_slot_ssm_projection_bytes[slot] +=
-                tensorDmmvBytesForCols(lt.attn_qkv, hidden_dim) +
-                tensorDmmvBytesForCols(lt.attn_gate, hidden_dim) +
+            const qkv_bytes = tensorDmmvBytesForCols(lt.attn_qkv, hidden_dim);
+            const gate_bytes = tensorDmmvBytesForCols(lt.attn_gate, hidden_dim);
+            const tail_bytes =
                 tensorDmmvBytesForCols(lt.ssm_alpha, hidden_dim) +
                 tensorDmmvBytesForCols(lt.ssm_beta, hidden_dim);
+            profile.decode_async_slot_ssm_qkv_bytes[slot] += qkv_bytes;
+            profile.decode_async_slot_ssm_gate_bytes[slot] += gate_bytes;
+            profile.decode_async_slot_ssm_tail_bytes[slot] += tail_bytes;
+            profile.decode_async_slot_ssm_projection_bytes[slot] += qkv_bytes + gate_bytes + tail_bytes;
             profile.decode_async_slot_ssm_out_bytes[slot] += tensorDmmvBytesForCols(lt.ssm_out, d_inner);
         }
 
@@ -31332,6 +31374,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     prefix.decode_async_slot_dense_ffn_layers[0] = 16;
     prefix.decode_async_slot_full_attn_bytes[0] = 200;
     prefix.decode_async_slot_ssm_projection_bytes[0] = 300;
+    prefix.decode_async_slot_ssm_qkv_bytes[0] = 100;
+    prefix.decode_async_slot_ssm_gate_bytes[0] = 120;
+    prefix.decode_async_slot_ssm_tail_bytes[0] = 80;
     prefix.decode_async_slot_ssm_out_bytes[0] = 400;
     prefix.decode_async_slot_dense_ffn_bytes[0] = 500;
     prefix.decode_async_slot_dense_gate_bytes[0] = 100;
@@ -31351,6 +31396,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     prefix.decode_async_slot_dense_ffn_layers[1] = 24;
     prefix.decode_async_slot_full_attn_bytes[1] = 600;
     prefix.decode_async_slot_ssm_projection_bytes[1] = 700;
+    prefix.decode_async_slot_ssm_qkv_bytes[1] = 250;
+    prefix.decode_async_slot_ssm_gate_bytes[1] = 300;
+    prefix.decode_async_slot_ssm_tail_bytes[1] = 150;
     prefix.decode_async_slot_ssm_out_bytes[1] = 800;
     prefix.decode_async_slot_dense_ffn_bytes[1] = 900;
     prefix.decode_async_slot_dense_gate_bytes[1] = 200;
@@ -31409,6 +31457,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     total.decode_async_slot_dense_ffn_layers[0] = 56;
     total.decode_async_slot_full_attn_bytes[0] = 2_000;
     total.decode_async_slot_ssm_projection_bytes[0] = 3_000;
+    total.decode_async_slot_ssm_qkv_bytes[0] = 1_000;
+    total.decode_async_slot_ssm_gate_bytes[0] = 1_200;
+    total.decode_async_slot_ssm_tail_bytes[0] = 800;
     total.decode_async_slot_ssm_out_bytes[0] = 4_000;
     total.decode_async_slot_dense_ffn_bytes[0] = 5_000;
     total.decode_async_slot_dense_gate_bytes[0] = 1_000;
@@ -31428,6 +31479,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     total.decode_async_slot_dense_ffn_layers[1] = 88;
     total.decode_async_slot_full_attn_bytes[1] = 6_000;
     total.decode_async_slot_ssm_projection_bytes[1] = 7_000;
+    total.decode_async_slot_ssm_qkv_bytes[1] = 2_500;
+    total.decode_async_slot_ssm_gate_bytes[1] = 3_000;
+    total.decode_async_slot_ssm_tail_bytes[1] = 1_500;
     total.decode_async_slot_ssm_out_bytes[1] = 8_000;
     total.decode_async_slot_dense_ffn_bytes[1] = 9_000;
     total.decode_async_slot_dense_gate_bytes[1] = 2_000;
@@ -31455,6 +31509,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     try std.testing.expectEqual(@as(u32, 40), delta.decode_async_slot_dense_ffn_layers[0]);
     try std.testing.expectEqual(@as(u64, 1_800), delta.decode_async_slot_full_attn_bytes[0]);
     try std.testing.expectEqual(@as(u64, 2_700), delta.decode_async_slot_ssm_projection_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 900), delta.decode_async_slot_ssm_qkv_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 1_080), delta.decode_async_slot_ssm_gate_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 720), delta.decode_async_slot_ssm_tail_bytes[0]);
     try std.testing.expectEqual(@as(u64, 3_600), delta.decode_async_slot_ssm_out_bytes[0]);
     try std.testing.expectEqual(@as(u64, 4_500), delta.decode_async_slot_dense_ffn_bytes[0]);
     try std.testing.expectEqual(@as(u64, 900), delta.decode_async_slot_dense_gate_bytes[0]);
@@ -31474,6 +31531,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     try std.testing.expectEqual(@as(u32, 64), delta.decode_async_slot_dense_ffn_layers[1]);
     try std.testing.expectEqual(@as(u64, 5_400), delta.decode_async_slot_full_attn_bytes[1]);
     try std.testing.expectEqual(@as(u64, 6_300), delta.decode_async_slot_ssm_projection_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 2_250), delta.decode_async_slot_ssm_qkv_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 2_700), delta.decode_async_slot_ssm_gate_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 1_350), delta.decode_async_slot_ssm_tail_bytes[1]);
     try std.testing.expectEqual(@as(u64, 7_200), delta.decode_async_slot_ssm_out_bytes[1]);
     try std.testing.expectEqual(@as(u64, 8_100), delta.decode_async_slot_dense_ffn_bytes[1]);
     try std.testing.expectEqual(@as(u64, 1_800), delta.decode_async_slot_dense_gate_bytes[1]);
