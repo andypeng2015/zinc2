@@ -1166,6 +1166,56 @@ const DenseFfnBarrierPhaseCounters = struct {
     }
 };
 
+const DenseFfnBarrierPhaseNsCounters = struct {
+    norm: u64 = 0,
+    gate_up: u64 = 0,
+    activation: u64 = 0,
+    down: u64 = 0,
+    tail: u64 = 0,
+    scale: u64 = 0,
+
+    fn add(self: *DenseFfnBarrierPhaseNsCounters, phase: DenseFfnBarrierPhase, value: u64) void {
+        if (value == 0) return;
+        switch (phase) {
+            .norm => self.norm += value,
+            .gate_up => self.gate_up += value,
+            .activation => self.activation += value,
+            .down => self.down += value,
+            .tail => self.tail += value,
+            .scale => self.scale += value,
+        }
+    }
+
+    fn addCounts(self: *DenseFfnBarrierPhaseNsCounters, counts: DenseFfnBarrierPhaseNsCounters) void {
+        self.norm += counts.norm;
+        self.gate_up += counts.gate_up;
+        self.activation += counts.activation;
+        self.down += counts.down;
+        self.tail += counts.tail;
+        self.scale += counts.scale;
+    }
+
+    fn total(self: DenseFfnBarrierPhaseNsCounters) u64 {
+        return self.norm +
+            self.gate_up +
+            self.activation +
+            self.down +
+            self.tail +
+            self.scale;
+    }
+
+    fn diff(total_counts: DenseFfnBarrierPhaseNsCounters, prefix_counts: DenseFfnBarrierPhaseNsCounters) DenseFfnBarrierPhaseNsCounters {
+        return .{
+            .norm = total_counts.norm -| prefix_counts.norm,
+            .gate_up = total_counts.gate_up -| prefix_counts.gate_up,
+            .activation = total_counts.activation -| prefix_counts.activation,
+            .down = total_counts.down -| prefix_counts.down,
+            .tail = total_counts.tail -| prefix_counts.tail,
+            .scale = total_counts.scale -| prefix_counts.scale,
+        };
+    }
+};
+
 const GpuMoeBarrierPhase = enum(u8) {
     router,
     gate_up,
@@ -1293,6 +1343,9 @@ pub const RuntimeProfile = struct {
     dense_ffn_scope_barrier_calls_by_phase: DenseFfnBarrierPhaseCounters = .{},
     dense_ffn_resource_barrier_calls_by_phase: DenseFfnBarrierPhaseCounters = .{},
     dense_ffn_resource_barrier_resources_by_phase: DenseFfnBarrierPhaseCounters = .{},
+    dense_ffn_barrier_encode_ns_by_phase: DenseFfnBarrierPhaseNsCounters = .{},
+    dense_ffn_scope_barrier_encode_ns_by_phase: DenseFfnBarrierPhaseNsCounters = .{},
+    dense_ffn_resource_barrier_encode_ns_by_phase: DenseFfnBarrierPhaseNsCounters = .{},
     dense_ffn_norm_dispatch_calls: u32 = 0,
     dense_ffn_gate_up_dispatch_calls: u32 = 0,
     dense_ffn_activation_dispatch_calls: u32 = 0,
@@ -1381,6 +1434,9 @@ pub const RuntimeProfile = struct {
     decode_async_slot_dense_scope_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
     decode_async_slot_dense_resource_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
     decode_async_slot_dense_resource_barrier_entries_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = [_]DenseFfnBarrierPhaseNsCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_scope_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = [_]DenseFfnBarrierPhaseNsCounters{.{}} ** decode_async_profile_slots,
+    decode_async_slot_dense_resource_barrier_encode_ns_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseNsCounters = [_]DenseFfnBarrierPhaseNsCounters{.{}} ** decode_async_profile_slots,
     sample_ns: u64 = 0,
     total_step_ns: u64 = 0,
     debug_validation_ns: u64 = 0,
@@ -1784,21 +1840,41 @@ fn recordDenseFfnBarrierKind(
     }
 }
 
+fn recordDenseFfnBarrierEncodeNs(
+    profile: ?*RuntimeProfile,
+    phase: DenseFfnBarrierPhase,
+    elapsed_ns: u64,
+    scope_delta: u32,
+    resource_delta: u32,
+) void {
+    if (elapsed_ns == 0) return;
+    if (profile) |p| {
+        p.dense_ffn_barrier_encode_ns_by_phase.add(phase, elapsed_ns);
+        if (scope_delta != 0) p.dense_ffn_scope_barrier_encode_ns_by_phase.add(phase, elapsed_ns);
+        if (resource_delta != 0) p.dense_ffn_resource_barrier_encode_ns_by_phase.add(phase, elapsed_ns);
+    }
+}
+
 fn profileDenseFfnBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase) void {
     const before_count = cmd.barrier_count;
     const before_scope_count = cmd.scope_barrier_count;
     const before_resource_count = cmd.resource_barrier_count;
     const before_resource_entries = cmd.resource_barrier_resources;
+    const barrier_start = profileStart(profile != null);
     cmd.barrier();
+    const elapsed_ns = profileElapsedNs(barrier_start);
     if (cmd.barrier_count == before_count) return;
+    const scope_delta = cmd.scope_barrier_count -| before_scope_count;
+    const resource_delta = cmd.resource_barrier_count -| before_resource_count;
     recordDenseFfnBarrierPhase(profile, phase);
     recordDenseFfnBarrierKind(
         profile,
         phase,
-        cmd.scope_barrier_count -| before_scope_count,
-        cmd.resource_barrier_count -| before_resource_count,
+        scope_delta,
+        resource_delta,
         cmd.resource_barrier_resources -| before_resource_entries,
     );
+    recordDenseFfnBarrierEncodeNs(profile, phase, elapsed_ns, scope_delta, resource_delta);
 }
 
 fn profileDenseFfnBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, phase: DenseFfnBarrierPhase, bufs: []const *const MetalBuffer) void {
@@ -1806,16 +1882,21 @@ fn profileDenseFfnBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, 
     const before_scope_count = cmd.scope_barrier_count;
     const before_resource_count = cmd.resource_barrier_count;
     const before_resource_entries = cmd.resource_barrier_resources;
+    const barrier_start = profileStart(profile != null);
     cmd.barrierBuffers(bufs);
+    const elapsed_ns = profileElapsedNs(barrier_start);
     if (cmd.barrier_count == before_count) return;
+    const scope_delta = cmd.scope_barrier_count -| before_scope_count;
+    const resource_delta = cmd.resource_barrier_count -| before_resource_count;
     recordDenseFfnBarrierPhase(profile, phase);
     recordDenseFfnBarrierKind(
         profile,
         phase,
-        cmd.scope_barrier_count -| before_scope_count,
-        cmd.resource_barrier_count -| before_resource_count,
+        scope_delta,
+        resource_delta,
         cmd.resource_barrier_resources -| before_resource_entries,
     );
+    recordDenseFfnBarrierEncodeNs(profile, phase, elapsed_ns, scope_delta, resource_delta);
 }
 
 fn profileDenseFfnTailBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant) void {
@@ -1823,17 +1904,22 @@ fn profileDenseFfnTailBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, var
     const before_scope_count = cmd.scope_barrier_count;
     const before_resource_count = cmd.resource_barrier_count;
     const before_resource_entries = cmd.resource_barrier_resources;
+    const barrier_start = profileStart(profile != null);
     cmd.barrier();
+    const elapsed_ns = profileElapsedNs(barrier_start);
     if (cmd.barrier_count == before_count) return;
+    const scope_delta = cmd.scope_barrier_count -| before_scope_count;
+    const resource_delta = cmd.resource_barrier_count -| before_resource_count;
     recordDenseFfnBarrierPhase(profile, .tail);
     recordDenseFfnTailBarrierVariant(profile, variant);
     recordDenseFfnBarrierKind(
         profile,
         .tail,
-        cmd.scope_barrier_count -| before_scope_count,
-        cmd.resource_barrier_count -| before_resource_count,
+        scope_delta,
+        resource_delta,
         cmd.resource_barrier_resources -| before_resource_entries,
     );
+    recordDenseFfnBarrierEncodeNs(profile, .tail, elapsed_ns, scope_delta, resource_delta);
 }
 
 fn profileDenseFfnTailBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, variant: DenseFfnTailBarrierVariant, bufs: []const *const MetalBuffer) void {
@@ -1841,17 +1927,22 @@ fn profileDenseFfnTailBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfi
     const before_scope_count = cmd.scope_barrier_count;
     const before_resource_count = cmd.resource_barrier_count;
     const before_resource_entries = cmd.resource_barrier_resources;
+    const barrier_start = profileStart(profile != null);
     cmd.barrierBuffers(bufs);
+    const elapsed_ns = profileElapsedNs(barrier_start);
     if (cmd.barrier_count == before_count) return;
+    const scope_delta = cmd.scope_barrier_count -| before_scope_count;
+    const resource_delta = cmd.resource_barrier_count -| before_resource_count;
     recordDenseFfnBarrierPhase(profile, .tail);
     recordDenseFfnTailBarrierVariant(profile, variant);
     recordDenseFfnBarrierKind(
         profile,
         .tail,
-        cmd.scope_barrier_count -| before_scope_count,
-        cmd.resource_barrier_count -| before_resource_count,
+        scope_delta,
+        resource_delta,
         cmd.resource_barrier_resources -| before_resource_entries,
     );
+    recordDenseFfnBarrierEncodeNs(profile, .tail, elapsed_ns, scope_delta, resource_delta);
 }
 
 fn profileFullAttnQkvBarrier(
@@ -1950,6 +2041,16 @@ fn avgMs(ns: u64, count: anytype) f64 {
     const denom = @as(u64, count);
     if (denom == 0) return 0.0;
     return nsToMs(ns) / @as(f64, @floatFromInt(denom));
+}
+
+fn nsToUs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000.0;
+}
+
+fn avgUs(ns: u64, count: anytype) f64 {
+    const denom = @as(u64, count);
+    if (denom == 0) return 0.0;
+    return nsToUs(ns) / @as(f64, @floatFromInt(denom));
 }
 
 fn pctOf(total_ns: u64, part_ns: u64) f64 {
@@ -2097,6 +2198,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.dense_ffn_scope_barrier_calls_by_phase = DenseFfnBarrierPhaseCounters.diff(total.dense_ffn_scope_barrier_calls_by_phase, prefix.dense_ffn_scope_barrier_calls_by_phase);
     delta.dense_ffn_resource_barrier_calls_by_phase = DenseFfnBarrierPhaseCounters.diff(total.dense_ffn_resource_barrier_calls_by_phase, prefix.dense_ffn_resource_barrier_calls_by_phase);
     delta.dense_ffn_resource_barrier_resources_by_phase = DenseFfnBarrierPhaseCounters.diff(total.dense_ffn_resource_barrier_resources_by_phase, prefix.dense_ffn_resource_barrier_resources_by_phase);
+    delta.dense_ffn_barrier_encode_ns_by_phase = DenseFfnBarrierPhaseNsCounters.diff(total.dense_ffn_barrier_encode_ns_by_phase, prefix.dense_ffn_barrier_encode_ns_by_phase);
+    delta.dense_ffn_scope_barrier_encode_ns_by_phase = DenseFfnBarrierPhaseNsCounters.diff(total.dense_ffn_scope_barrier_encode_ns_by_phase, prefix.dense_ffn_scope_barrier_encode_ns_by_phase);
+    delta.dense_ffn_resource_barrier_encode_ns_by_phase = DenseFfnBarrierPhaseNsCounters.diff(total.dense_ffn_resource_barrier_encode_ns_by_phase, prefix.dense_ffn_resource_barrier_encode_ns_by_phase);
     delta.dense_ffn_norm_dispatch_calls = total.dense_ffn_norm_dispatch_calls -| prefix.dense_ffn_norm_dispatch_calls;
     delta.dense_ffn_gate_up_dispatch_calls = total.dense_ffn_gate_up_dispatch_calls -| prefix.dense_ffn_gate_up_dispatch_calls;
     delta.dense_ffn_activation_dispatch_calls = total.dense_ffn_activation_dispatch_calls -| prefix.dense_ffn_activation_dispatch_calls;
@@ -2170,6 +2274,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
         delta.decode_async_slot_dense_scope_barrier_phases[idx] = DenseFfnBarrierPhaseCounters.diff(total.decode_async_slot_dense_scope_barrier_phases[idx], prefix.decode_async_slot_dense_scope_barrier_phases[idx]);
         delta.decode_async_slot_dense_resource_barrier_phases[idx] = DenseFfnBarrierPhaseCounters.diff(total.decode_async_slot_dense_resource_barrier_phases[idx], prefix.decode_async_slot_dense_resource_barrier_phases[idx]);
         delta.decode_async_slot_dense_resource_barrier_entries_phases[idx] = DenseFfnBarrierPhaseCounters.diff(total.decode_async_slot_dense_resource_barrier_entries_phases[idx], prefix.decode_async_slot_dense_resource_barrier_entries_phases[idx]);
+        delta.decode_async_slot_dense_barrier_encode_ns_phases[idx] = DenseFfnBarrierPhaseNsCounters.diff(total.decode_async_slot_dense_barrier_encode_ns_phases[idx], prefix.decode_async_slot_dense_barrier_encode_ns_phases[idx]);
+        delta.decode_async_slot_dense_scope_barrier_encode_ns_phases[idx] = DenseFfnBarrierPhaseNsCounters.diff(total.decode_async_slot_dense_scope_barrier_encode_ns_phases[idx], prefix.decode_async_slot_dense_scope_barrier_encode_ns_phases[idx]);
+        delta.decode_async_slot_dense_resource_barrier_encode_ns_phases[idx] = DenseFfnBarrierPhaseNsCounters.diff(total.decode_async_slot_dense_resource_barrier_encode_ns_phases[idx], prefix.decode_async_slot_dense_resource_barrier_encode_ns_phases[idx]);
     }
     delta.sample_ns = total.sample_ns -| prefix.sample_ns;
     delta.total_step_ns = total.total_step_ns -| prefix.total_step_ns;
@@ -2604,6 +2711,43 @@ fn logDenseFfnBarrierKindBreakdown(label: []const u8, profile: RuntimeProfile) v
             entries.scale,
         });
     }
+    const encode = profile.dense_ffn_barrier_encode_ns_by_phase;
+    if (encode.total() > 0) {
+        const counts = denseBarrierPhaseCountersFromProfile(profile);
+        log.info("  {s} dense barrier encode us/call: norm {d:.2} gate-up {d:.2} activation {d:.2} down {d:.2} tail {d:.2} scale {d:.2}", .{
+            label,
+            avgUs(encode.norm, counts.norm),
+            avgUs(encode.gate_up, counts.gate_up),
+            avgUs(encode.activation, counts.activation),
+            avgUs(encode.down, counts.down),
+            avgUs(encode.tail, counts.tail),
+            avgUs(encode.scale, counts.scale),
+        });
+        if (profile.dense_ffn_scope_barrier_encode_ns_by_phase.total() > 0) {
+            const scope_ns = profile.dense_ffn_scope_barrier_encode_ns_by_phase;
+            log.info("  {s} dense scope barrier encode us/call: norm {d:.2} gate-up {d:.2} activation {d:.2} down {d:.2} tail {d:.2} scale {d:.2}", .{
+                label,
+                avgUs(scope_ns.norm, scope.norm),
+                avgUs(scope_ns.gate_up, scope.gate_up),
+                avgUs(scope_ns.activation, scope.activation),
+                avgUs(scope_ns.down, scope.down),
+                avgUs(scope_ns.tail, scope.tail),
+                avgUs(scope_ns.scale, scope.scale),
+            });
+        }
+        if (profile.dense_ffn_resource_barrier_encode_ns_by_phase.total() > 0) {
+            const resource_ns = profile.dense_ffn_resource_barrier_encode_ns_by_phase;
+            log.info("  {s} dense resource barrier encode us/call: norm {d:.2} gate-up {d:.2} activation {d:.2} down {d:.2} tail {d:.2} scale {d:.2}", .{
+                label,
+                avgUs(resource_ns.norm, resource.norm),
+                avgUs(resource_ns.gate_up, resource.gate_up),
+                avgUs(resource_ns.activation, resource.activation),
+                avgUs(resource_ns.down, resource.down),
+                avgUs(resource_ns.tail, resource.tail),
+                avgUs(resource_ns.scale, resource.scale),
+            });
+        }
+    }
 }
 
 fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void {
@@ -2612,6 +2756,7 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
     var emitted_phase_header = false;
     var emitted_dense_dispatch_header = false;
     var emitted_dense_barrier_kind_header = false;
+    var emitted_dense_barrier_encode_header = false;
     var slowest_slot: ?usize = null;
     var slowest_gpu_ms: f64 = 0.0;
     for (0..decode_async_profile_slots) |slot| {
@@ -2753,6 +2898,37 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
                 avgCount(dense_entries.down, submits),
                 avgCount(dense_entries.tail, submits),
                 avgCount(dense_entries.scale, submits),
+            });
+        }
+        const dense_encode = profile.decode_async_slot_dense_barrier_encode_ns_phases[slot];
+        if (dense_encode.total() > 0) {
+            if (!emitted_dense_barrier_encode_header) {
+                log.info("  {s} async decode chunk slot dense barrier encode us/call order: all norm/gate-up/activation/down/tail/scale | scope same | resource same", .{label});
+                emitted_dense_barrier_encode_header = true;
+            }
+            const dense_scope_ns = profile.decode_async_slot_dense_scope_barrier_encode_ns_phases[slot];
+            const dense_resource_ns = profile.decode_async_slot_dense_resource_barrier_encode_ns_phases[slot];
+            log.info("  {s} async decode chunk slot {d} dense barrier encode us/call: all {d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2} scope {d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2} resource {d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2}", .{
+                label,
+                slot,
+                avgUs(dense_encode.norm, dense_barriers.norm),
+                avgUs(dense_encode.gate_up, dense_barriers.gate_up),
+                avgUs(dense_encode.activation, dense_barriers.activation),
+                avgUs(dense_encode.down, dense_barriers.down),
+                avgUs(dense_encode.tail, dense_barriers.tail),
+                avgUs(dense_encode.scale, dense_barriers.scale),
+                avgUs(dense_scope_ns.norm, dense_scope.norm),
+                avgUs(dense_scope_ns.gate_up, dense_scope.gate_up),
+                avgUs(dense_scope_ns.activation, dense_scope.activation),
+                avgUs(dense_scope_ns.down, dense_scope.down),
+                avgUs(dense_scope_ns.tail, dense_scope.tail),
+                avgUs(dense_scope_ns.scale, dense_scope.scale),
+                avgUs(dense_resource_ns.norm, dense_resource.norm),
+                avgUs(dense_resource_ns.gate_up, dense_resource.gate_up),
+                avgUs(dense_resource_ns.activation, dense_resource.activation),
+                avgUs(dense_resource_ns.down, dense_resource.down),
+                avgUs(dense_resource_ns.tail, dense_resource.tail),
+                avgUs(dense_resource_ns.scale, dense_resource.scale),
             });
         }
     }
@@ -23321,6 +23497,24 @@ fn recordDecodeAsyncSlotBarrierPhases(
         DenseFfnBarrierPhaseCounters.diff(
             profile.dense_ffn_resource_barrier_resources_by_phase,
             prefix.dense_ffn_resource_barrier_resources_by_phase,
+        ),
+    );
+    profile.decode_async_slot_dense_barrier_encode_ns_phases[slot].addCounts(
+        DenseFfnBarrierPhaseNsCounters.diff(
+            profile.dense_ffn_barrier_encode_ns_by_phase,
+            prefix.dense_ffn_barrier_encode_ns_by_phase,
+        ),
+    );
+    profile.decode_async_slot_dense_scope_barrier_encode_ns_phases[slot].addCounts(
+        DenseFfnBarrierPhaseNsCounters.diff(
+            profile.dense_ffn_scope_barrier_encode_ns_by_phase,
+            prefix.dense_ffn_scope_barrier_encode_ns_by_phase,
+        ),
+    );
+    profile.decode_async_slot_dense_resource_barrier_encode_ns_phases[slot].addCounts(
+        DenseFfnBarrierPhaseNsCounters.diff(
+            profile.dense_ffn_resource_barrier_encode_ns_by_phase,
+            prefix.dense_ffn_resource_barrier_encode_ns_by_phase,
         ),
     );
 }
