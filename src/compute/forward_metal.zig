@@ -23278,11 +23278,17 @@ fn runDecodeStep(
                 const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
                 const ssm_activation_buf: *const MetalBuffer = if (use_fused_delta_gated_norm) &engine.attn_out_buf else &engine.swiglu_buf;
                 dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, ssm_activation_buf, &engine.down_buf, hidden_dim, d_inner, 0);
-                // The residual/router step only depends on the SSM projection
-                // row, and no unrelated SSM work remains queued at this edge.
-                // Match llama.cpp's reset path with a scope barrier instead of
-                // paying one-resource setup for every Qwen27 SSM layer.
-                profileSsmBarrier(cmd, profile, .out);
+                // Adapt llama.cpp `ggml_metal_op_concurrency_check`: on the
+                // Qwen3.6 27B dense-hybrid path, the next residual+norm join
+                // reads only the previous hidden row and the SSM out row. Keep
+                // unrelated SSM state/conv/tail writes out of this dependency
+                // edge so dense FFN recording can overlap those drains inside
+                // the 8-layer hybrid command chunk.
+                if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+                    profileSsmResourceBarrierBuffers(cmd, profile, .out, &.{ &engine.hidden_buf, &engine.down_buf });
+                } else {
+                    profileSsmBarrier(cmd, profile, .out);
+                }
                 if (should_debug_ssm_compare) {
                     commitAndWaitProfiled(cmd, profile);
                     const debug_start = profileStart(profile != null);
