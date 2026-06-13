@@ -1706,6 +1706,14 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.full_attn_out_dispatch_calls = total.full_attn_out_dispatch_calls -| prefix.full_attn_out_dispatch_calls;
     delta.full_attn_residual_dispatch_calls = total.full_attn_residual_dispatch_calls -| prefix.full_attn_residual_dispatch_calls;
     delta.ssm_barrier_calls = total.ssm_barrier_calls -| prefix.ssm_barrier_calls;
+    delta.ssm_proj_norm_barrier_calls = total.ssm_proj_norm_barrier_calls -| prefix.ssm_proj_norm_barrier_calls;
+    delta.ssm_qkv_barrier_calls = total.ssm_qkv_barrier_calls -| prefix.ssm_qkv_barrier_calls;
+    delta.ssm_tail_barrier_calls = total.ssm_tail_barrier_calls -| prefix.ssm_tail_barrier_calls;
+    delta.ssm_conv_barrier_calls = total.ssm_conv_barrier_calls -| prefix.ssm_conv_barrier_calls;
+    delta.ssm_delta_barrier_calls = total.ssm_delta_barrier_calls -| prefix.ssm_delta_barrier_calls;
+    delta.ssm_gated_norm_barrier_calls = total.ssm_gated_norm_barrier_calls -| prefix.ssm_gated_norm_barrier_calls;
+    delta.ssm_out_barrier_calls = total.ssm_out_barrier_calls -| prefix.ssm_out_barrier_calls;
+    delta.ssm_residual_barrier_calls = total.ssm_residual_barrier_calls -| prefix.ssm_residual_barrier_calls;
     delta.router_barrier_calls = total.router_barrier_calls -| prefix.router_barrier_calls;
     delta.gpu_routed_moe_barrier_calls = total.gpu_routed_moe_barrier_calls -| prefix.gpu_routed_moe_barrier_calls;
     delta.fallback_moe_barrier_calls = total.fallback_moe_barrier_calls -| prefix.fallback_moe_barrier_calls;
@@ -2112,6 +2120,34 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.full_attn_qkv_raw_k_as_v_calls,
             profile.full_attn_qkv_paired_q8_calls,
             profile.full_attn_qkv_separate_calls,
+        });
+    }
+
+    if (profile.ssm_barrier_calls > 0) {
+        const typed_ssm_barriers =
+            profile.ssm_proj_norm_barrier_calls +
+            profile.ssm_qkv_barrier_calls +
+            profile.ssm_tail_barrier_calls +
+            profile.ssm_conv_barrier_calls +
+            profile.ssm_delta_barrier_calls +
+            profile.ssm_gated_norm_barrier_calls +
+            profile.ssm_out_barrier_calls +
+            profile.ssm_residual_barrier_calls;
+        const other_ssm_barriers = if (profile.ssm_barrier_calls > typed_ssm_barriers)
+            profile.ssm_barrier_calls - typed_ssm_barriers
+        else
+            0;
+        log.info("  {s} ssm barriers: proj-norm {d} qkv {d} tail {d} conv {d} delta {d} gated {d} out {d} residual {d} other {d}", .{
+            label,
+            profile.ssm_proj_norm_barrier_calls,
+            profile.ssm_qkv_barrier_calls,
+            profile.ssm_tail_barrier_calls,
+            profile.ssm_conv_barrier_calls,
+            profile.ssm_delta_barrier_calls,
+            profile.ssm_gated_norm_barrier_calls,
+            profile.ssm_out_barrier_calls,
+            profile.ssm_residual_barrier_calls,
+            other_ssm_barriers,
         });
     }
 
@@ -30340,6 +30376,42 @@ test "DMMV hot-shape profile keeps dense gate and up separate" {
     try std.testing.expectEqual(DmmvDetailClass.dense_gate, delta.detail);
     try std.testing.expectEqual(@as(u64, 5), delta.bytes);
     try std.testing.expectEqual(@as(u32, 1), delta.calls);
+}
+
+test "profile split preserves SSM barrier phase counters" {
+    const prefix = RuntimeProfile{
+        .ssm_barrier_calls = 11,
+        .ssm_proj_norm_barrier_calls = 1,
+        .ssm_qkv_barrier_calls = 2,
+        .ssm_tail_barrier_calls = 3,
+        .ssm_conv_barrier_calls = 4,
+        .ssm_delta_barrier_calls = 5,
+        .ssm_gated_norm_barrier_calls = 6,
+        .ssm_out_barrier_calls = 7,
+        .ssm_residual_barrier_calls = 8,
+    };
+    const total = RuntimeProfile{
+        .ssm_barrier_calls = 41,
+        .ssm_proj_norm_barrier_calls = 11,
+        .ssm_qkv_barrier_calls = 22,
+        .ssm_tail_barrier_calls = 33,
+        .ssm_conv_barrier_calls = 44,
+        .ssm_delta_barrier_calls = 55,
+        .ssm_gated_norm_barrier_calls = 66,
+        .ssm_out_barrier_calls = 77,
+        .ssm_residual_barrier_calls = 88,
+    };
+
+    const delta = profileDeltaForSplit(total, prefix);
+    try std.testing.expectEqual(@as(u32, 30), delta.ssm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 10), delta.ssm_proj_norm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 20), delta.ssm_qkv_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 30), delta.ssm_tail_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 40), delta.ssm_conv_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 50), delta.ssm_delta_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 60), delta.ssm_gated_norm_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 70), delta.ssm_out_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 80), delta.ssm_residual_barrier_calls);
 }
 
 test "q8 lm head stays on GPU" {
