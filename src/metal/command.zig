@@ -24,7 +24,8 @@ inline fn timingFinish(cmd: *MetalCommand, pipe: *const MetalPipeline, t_start: 
     cmd.last_barrier_dispatch_count = cmd.dispatch_count;
     const elapsed_i = std.time.nanoTimestamp() - t_start;
     const elapsed_ns: u64 = if (elapsed_i < 0) 0 else @intCast(elapsed_i);
-    kernel_timing.record(@ptrCast(pipe.handle), pipe.name, elapsed_ns);
+    const label = if (cmd.timing_label) |timing_label| timing_label else pipe.name;
+    kernel_timing.record(@ptrCast(pipe.handle), label, elapsed_ns);
 }
 
 /// Encoder policy used when opening a Metal compute command buffer.
@@ -44,6 +45,17 @@ pub const MetalCommand = struct {
     resource_barrier_resources: u32 = 0,
     barrier_enabled: bool,
     last_barrier_dispatch_count: u32 = 0,
+    timing_label: ?[]const u8 = null,
+
+    /// Attach a one-dispatch timing label consumed by `ZINC_METAL_KERNEL_TIMING`.
+    /// The timing aggregator copies the bytes before this label can go stale.
+    pub fn setTimingLabel(self: *MetalCommand, label: []const u8) void {
+        self.timing_label = label;
+    }
+
+    pub fn clearTimingLabel(self: *MetalCommand) void {
+        self.timing_label = null;
+    }
 
     /// Encode a compute dispatch binding buffers, push constants, grid, and block sizes.
     pub fn dispatch(

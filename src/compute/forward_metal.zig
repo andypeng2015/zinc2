@@ -2128,6 +2128,56 @@ fn dmmvPathLabel(path: DmmvPathClass) []const u8 {
     };
 }
 
+fn dmmvDetailLabel(detail: DmmvDetailClass) []const u8 {
+    return switch (detail) {
+        .none => "none",
+        .full_attn_projection => "attn-proj",
+        .full_attn_output => "attn-out",
+        .ssm_qkv => "ssm-qkv",
+        .ssm_gate => "ssm-gate",
+        .ssm_tail => "ssm-tail",
+        .ssm_out => "ssm-out",
+        .dense_gate => "dense-gate",
+        .dense_up => "dense-up",
+        .dense_down => "dense-down",
+        .shared_gate_up => "shared-gate-up",
+        .shared_down => "shared-down",
+        .moe_gate_up => "moe-gate-up",
+        .moe_down => "moe-down",
+    };
+}
+
+fn setDmmvTimingLabel(
+    cmd: *MetalCommand,
+    engine: *const InferenceEngine,
+    tensor: *const metal_loader.LoadedTensor,
+    rows: u32,
+    cols: u32,
+    pipe: *const MetalPipeline,
+    buf: *[192]u8,
+) bool {
+    if (!kernel_timing.enabled) return false;
+
+    // Same metadata discipline as llama.cpp `ggml_metal_op_encode_impl`: the
+    // probe labels the logical graph edge, not just the reusable pipeline.
+    const path = classifyDmmvPath(engine, tensor);
+    const detail = classifyDmmvDetail(engine, tensor, path);
+    const label = std.fmt.bufPrint(
+        buf,
+        "dmmv {s} {s}/{s} M={d} K={d} pipe={s}",
+        .{
+            @tagName(tensor.info.type_),
+            dmmvPathLabel(path),
+            dmmvDetailLabel(detail),
+            rows,
+            cols,
+            pipe.name orelse "<unnamed>",
+        },
+    ) catch return false;
+    cmd.setTimingLabel(label);
+    return true;
+}
+
 fn logDmmvHotShapes(label: []const u8, stats: []const DmmvShapeStat) void {
     var top_idxs: [5]?usize = .{ null, null, null, null, null };
     for (stats, 0..) |slot, idx| {
@@ -11216,6 +11266,9 @@ fn dispatchDmmvOnCmdWithWeightBuf(
     };
     const bufs = [_]*const MetalBuffer{ weight_buf, input_buf, output_buf };
     const wgs = (M + pip.rows_per_wg - 1) / pip.rows_per_wg;
+    var timing_label_buf: [192]u8 = undefined;
+    const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, M, K, pip.pipe, &timing_label_buf);
+    defer if (has_timing_label) cmd.clearTimingLabel();
     cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
 }
 
@@ -11426,6 +11479,9 @@ fn dispatchLmHeadWithInputOffset(
     };
     const bufs = [_]*const MetalBuffer{ weight_buf, input_buf, output_buf };
     const wgs = (vocab_size + pip.rows_per_wg - 1) / pip.rows_per_wg;
+    var timing_label_buf: [192]u8 = undefined;
+    const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, vocab_size, hidden_dim, pip.pipe, &timing_label_buf);
+    defer if (has_timing_label) cmd.clearTimingLabel();
     cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
 }
 
@@ -11504,6 +11560,9 @@ fn dispatchDmmvOnCmdWithInputOffset(
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
     const wgs = (M + pip.rows_per_wg - 1) / pip.rows_per_wg;
+    var timing_label_buf: [192]u8 = undefined;
+    const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, M, K, pip.pipe, &timing_label_buf);
+    defer if (has_timing_label) cmd.clearTimingLabel();
     cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
 }
 
@@ -11534,6 +11593,9 @@ fn dispatchDmmvOnCmdWithInputOutputOffset(
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
     const wgs = (M + pip.rows_per_wg - 1) / pip.rows_per_wg;
+    var timing_label_buf: [192]u8 = undefined;
+    const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, M, K, pip.pipe, &timing_label_buf);
+    defer if (has_timing_label) cmd.clearTimingLabel();
     cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
 }
 
@@ -11809,6 +11871,9 @@ fn dispatchDenseQ6kSimdgroupDmmvOnCmd(
         const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
         const rows_per_wg: u32 = 4;
         const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+        var timing_label_buf: [192]u8 = undefined;
+        const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, M, K, selected_pipe, &timing_label_buf);
+        defer if (has_timing_label) cmd.clearTimingLabel();
         cmd.dispatchV2(selected_pipe, .{ wgs, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 1);
         return;
     }
