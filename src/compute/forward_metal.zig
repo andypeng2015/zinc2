@@ -731,6 +731,17 @@ fn defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg: ModelConfig) bool {
         cfg.ssm_n_group == 16;
 }
 
+fn hybridDecodeCommandGroupLayers(cfg: ModelConfig) usize {
+    if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+        // One layer per command buffer leaves Qwen3.6 27B with 64 async submits
+        // per token. llama.cpp's `ggml_metal_graph_compute` keeps graph work in
+        // a small queued command-buffer set; group one 3xSSM+1xattn block while
+        // avoiding the previously failed whole-token command buffer.
+        return 4;
+    }
+    return 1;
+}
+
 fn qwenSsmDeltaGatedNormExactShape(cfg: ModelConfig, dt_rank: u32, head_v_dim: u32, d_state: u32, n_group: u32) bool {
     if (head_v_dim != 128 or d_state != 128 or n_group != 16) return false;
     if (defaultQwen36SsmPrefillProjectionEnabled(cfg)) return dt_rank == 32;
@@ -21961,6 +21972,7 @@ fn runDecodeStep(
     // re-attempt for Qwen3-8B without a different lever (e.g. holding GPU
     // clocks via residency-set warm-loop) — see EFFORT_14_NOTES.md.
     const dense_cmd_group_layers: usize = 60;
+    const hybrid_cmd_group_layers = hybridDecodeCommandGroupLayers(cfg);
     const use_single_gpu_cmd = !engine.debug_validation_enabled and
         !engine.gemma_moe_validation_enabled and
         !engine.qwen_prefill_validation_enabled and
@@ -22082,9 +22094,15 @@ fn runDecodeStep(
         .barrier_count = 0,
         .barrier_enabled = false,
     };
+    var hybrid_group_cmd_storage = MetalCommand{
+        .handle = null,
+        .dispatch_count = 0,
+        .barrier_count = 0,
+        .barrier_enabled = false,
+    };
     // Sized to hold one token's worth of async layer command buffers. The
     // use_dense_layer_cmd path submits a few grouped chunks, while the hybrid
-    // SSM dense path submits one command per layer. Keep 256 slots so a full
+    // SSM dense path submits one small layer group at a time. Keep 256 slots so a full
     // 64-layer token can stay queued even if a future validation/debug path
     // temporarily splits a layer command.
     var dense_pending_cmds: [256]MetalCommand = undefined;
@@ -22120,12 +22138,6 @@ fn runDecodeStep(
         // standalone scale_in_place dispatch + barrier at the layer tail can
         // then be skipped (≈60 dispatches/60 barriers per token on Gemma 31B).
         var layer_output_scale_fused_into_post_norm: bool = false;
-        var hybrid_layer_cmd_storage = MetalCommand{
-            .handle = null,
-            .dispatch_count = 0,
-            .barrier_count = 0,
-            .barrier_enabled = false,
-        };
         const use_hybrid_layer_cmd = use_async_local_decode and shared_cmd == null and !use_dense_layer_cmd;
         const layer_shared_cmd: ?*MetalCommand = if (shared_cmd) |cmd|
             cmd
@@ -22135,8 +22147,10 @@ fn runDecodeStep(
             }
             break :blk &dense_group_cmd_storage;
         } else if (use_hybrid_layer_cmd) blk: {
-            hybrid_layer_cmd_storage = try beginProfiledCommand(engine, profile);
-            break :blk &hybrid_layer_cmd_storage;
+            if (hybrid_group_cmd_storage.handle == null) {
+                hybrid_group_cmd_storage = try beginProfiledCommand(engine, profile);
+            }
+            break :blk &hybrid_group_cmd_storage;
         } else null;
 
         if (is_full_attn) {
@@ -23833,7 +23847,7 @@ fn runDecodeStep(
                 recordDenseFfnDispatchDelta(profile, .down, down_dispatch_before, cmd.dispatch_count);
                 if (layer_shared_cmd != null) {
                     // Qwen3.6 27B hybrid decode keeps one command buffer per
-                    // layer. The following tail only joins the deferred
+                    // small layer group. The following tail only joins the deferred
                     // residual write with dense-down output, so fence those
                     // two resources instead of every prior buffer write.
                     if (use_hybrid_layer_cmd and defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
@@ -23856,11 +23870,13 @@ fn runDecodeStep(
                     layer_shared_cmd != null and
                     shared_cmd == null and
                     next_layer_idx_u == layer_count;
+                const hybrid_cmd_group_boundary = use_hybrid_layer_cmd and
+                    (next_layer_idx_u == layer_count or next_layer_idx_u % hybrid_cmd_group_layers == 0);
                 const ends_dense_cmd_chunk = layer_shared_cmd != null and
                     ((use_dense_layer_cmd and
                         (next_layer_idx_u == layer_count or next_layer_idx_u % dense_cmd_group_layers == 0) and
                         !keep_terminal_dense_cmd_for_final) or
-                        use_hybrid_layer_cmd);
+                        hybrid_cmd_group_boundary);
                 const layer_output_scale_folded_pre = skip_pre_ffn_router and !engine.debug_validation_enabled;
                 // The fused kernel now folds an arbitrary `hidden_scale` into
                 // its in-place hidden write, so a non-unit `layer_output_scale`
@@ -24027,8 +24043,11 @@ fn runDecodeStep(
         if (engine.debug_validation_enabled and engine.position == 0) {
             logLayerDiagnostics(engine, lt, layer, is_full_attn, "post_ffn");
         }
-        if (use_hybrid_layer_cmd and hybrid_layer_cmd_storage.handle != null) {
-            submitPendingDenseCommand(&hybrid_layer_cmd_storage, dense_pending_cmds[0..], &dense_pending_count, profile);
+        if (use_hybrid_layer_cmd and hybrid_group_cmd_storage.handle != null) {
+            const next_layer = layer_idx + 1;
+            if (next_layer == layer_count or next_layer % hybrid_cmd_group_layers == 0) {
+                submitPendingDenseCommand(&hybrid_group_cmd_storage, dense_pending_cmds[0..], &dense_pending_count, profile);
+            }
         }
         if (use_dense_layer_cmd and dense_group_cmd_storage.handle != null) {
             const next_layer = layer_idx + 1;
@@ -30097,6 +30116,7 @@ test "q6k simdgroup route covers qwen35 27b exact shapes" {
     try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen35));
     try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen2_moe));
     try std.testing.expect(defaultQwen35Dense27bSsmDeltaGatedNormEnabled(qwen35_27b_cfg));
+    try std.testing.expectEqual(@as(usize, 4), hybridDecodeCommandGroupLayers(qwen35_27b_cfg));
     try std.testing.expect(qwenSsmDeltaGatedNormExactShape(qwen35_27b_cfg, 48, 128, 128, 16));
     try std.testing.expect(!qwenSsmDeltaGatedNormExactShape(qwen35_27b_cfg, 32, 128, 128, 16));
     try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
