@@ -294,6 +294,14 @@ fn isQwen35SsmQkvQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K:
         std.mem.endsWith(u8, tensor_name, "attn_qkv.weight");
 }
 
+fn isQwen35SsmGateQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg) and
+        M == cfg.ssm_d_inner and
+        K == cfg.hidden_dim and
+        K == qwen35_27b_dense_gate_up_q4k_blocks * 256 and
+        std.mem.endsWith(u8, tensor_name, "attn_gate.weight");
+}
+
 fn isQwen35LmHeadQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
     return cfg.architecture == .qwen35 and
         cfg.hidden_dim == 5120 and
@@ -10852,6 +10860,37 @@ fn canUseDenseQ4KQKQ6KV(
         engine.dmmv_q4k_qk_q6k_v_pipe.max_threads_per_threadgroup >= 64;
 }
 
+fn canUseQwen35SsmQ6Q4QkvGatePair(
+    engine: *const InferenceEngine,
+    qkv: *const metal_loader.LoadedTensor,
+    gate: *const metal_loader.LoadedTensor,
+    qkv_buf: *const MetalBuffer,
+    gate_buf: *const MetalBuffer,
+    qkv_rows: u32,
+    gate_rows: u32,
+    K: u32,
+) bool {
+    // Adapt llama.cpp `ggml_metal_op_encode_impl` dependency batching to the
+    // exact Qwen3.6 27B SSM projection pair: qkv and gate read the same norm
+    // row and are only joined later at the conv/delta boundary. Reuse the
+    // existing mixed Q4_K/Q6_K QKV shader with M_q=0 so this removes one
+    // SSM projection dispatch without introducing a new arithmetic kernel.
+    return !engine.in_prefill_phase and
+        !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        qkv_buf == &qkv.gpu_buffer and
+        gate_buf == &gate.gpu_buffer and
+        qkv.info.type_ == .q6_k and
+        gate.info.type_ == .q4_k and
+        isQwen35SsmQkvQ6kTarget(engine.config, qkv.info.name, qkv_rows, K) and
+        isQwen35SsmGateQ4kTarget(engine.config, gate.info.name, gate_rows, K) and
+        (qkv_rows % 4) == 0 and
+        (gate_rows % 4) == 0 and
+        engine.dmmv_q4k_qk_q6k_v_pipe.handle != null and
+        engine.dmmv_q4k_qk_q6k_v_pipe.max_threads_per_threadgroup >= 64;
+}
+
 fn canUseDenseQ4KQKV(
     engine: *const InferenceEngine,
     q: *const metal_loader.LoadedTensor,
@@ -10992,6 +11031,49 @@ fn dispatchDenseQ4KQKQ6KVOnCmd(
     const rows_per_wg: u32 = 4; // NSG=2 * NR0=2
     const block_size: u32 = 64;
     const total_rows = M_q + M_k + M_v;
+    cmd.dispatchV2(&engine.dmmv_q4k_qk_q6k_v_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(QKVDensePush), 3);
+}
+
+fn dispatchQwen35SsmQ6Q4QkvGatePairOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    qkv_tensor: *const metal_loader.LoadedTensor,
+    gate_tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    qkv_buf: *const MetalBuffer,
+    gate_buf: *const MetalBuffer,
+    qkv_rows: u32,
+    gate_rows: u32,
+    K: u32,
+) void {
+    recordDmmvProfile(engine, qkv_tensor, qkv_rows, K);
+    recordDmmvProfile(engine, gate_tensor, gate_rows, K);
+
+    const push = QKVDensePush{
+        .M_q = 0,
+        .M_k = gate_rows,
+        .M_v = qkv_rows,
+        .K = K,
+        .a_q_offset = tensorPageOffset(engine.model, gate_tensor),
+        .a_k_offset = tensorPageOffset(engine.model, gate_tensor),
+        .a_v_offset = tensorPageOffset(engine.model, qkv_tensor),
+        .x_offset = 0,
+        .y_q_offset = 0,
+        .y_k_offset = 0,
+        .y_v_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &gate_tensor.gpu_buffer,
+        &gate_tensor.gpu_buffer,
+        &qkv_tensor.gpu_buffer,
+        input_buf,
+        gate_buf,
+        gate_buf,
+        qkv_buf,
+    };
+    const rows_per_wg: u32 = 4;
+    const block_size: u32 = 64;
+    const total_rows = gate_rows + qkv_rows;
     cmd.dispatchV2(&engine.dmmv_q4k_qk_q6k_v_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(QKVDensePush), 3);
 }
 
@@ -23929,6 +24011,14 @@ fn runDecodeStep(
                         // private-repacked TG128 row grouping but encode one dispatch.
                         dispatchQwenSsmDualRepackedQ8K2048OnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
                         z_projection_queued_before_conv = true;
+                    } else if (canUseQwen35SsmQ6Q4QkvGatePair(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
+                        // Same same-input projection batching as llama.cpp
+                        // `ggml_metal_op_mul_mat_id`, but for dense Qwen3.6
+                        // 27B's SSM qkv+gate pair instead of routed experts.
+                        // M_q=0 routes Q4_K gate to gate_buf and Q6_K qkv to
+                        // attn_out_buf through one mixed projection dispatch.
+                        dispatchQwen35SsmQ6Q4QkvGatePairOnCmd(engine, cmd, wqkv_t, z_t, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
+                        z_projection_queued_before_conv = true;
                     } else {
                         dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
                     }
@@ -23979,6 +24069,13 @@ fn runDecodeStep(
                     profileSsmBarrierBuffers(cmd, profile, .proj_norm, &.{&engine.norm_buf});
                     if (canUseQwenSsmDualRepackedQ8K2048(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
                         dispatchQwenSsmDualRepackedQ8K2048OnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
+                        z_projection_queued_before_conv = true;
+                    } else if (canUseQwen35SsmQ6Q4QkvGatePair(engine, wqkv_t, z_t, wqkv_buf, z_buf, conv_channels, d_inner, hidden_dim)) {
+                        // Reuse the existing mixed Q4_K/Q6_K projection kernel
+                        // for the exact Qwen3.6 27B SSM pair. This keeps the
+                        // alpha/beta tail projection ordering unchanged while
+                        // eliminating the standalone Q4_K gate launch.
+                        dispatchQwen35SsmQ6Q4QkvGatePairOnCmd(engine, cmd, wqkv_t, z_t, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
                         z_projection_queued_before_conv = true;
                     } else {
                         dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
@@ -31320,6 +31417,9 @@ test "q6k simdgroup route covers qwen35 27b exact shapes" {
     try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ssm_out.weight", 5120, 6144));
     try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "output.weight", 248320, 4096));
     try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "output.weight", 151936, 5120));
+    try std.testing.expect(isQwen35SsmGateQ4kTarget(qwen35_27b_cfg, "blk.0.attn_gate.weight", 6144, 5120));
+    try std.testing.expect(!isQwen35SsmGateQ4kTarget(qwen35_27b_cfg, "blk.0.attn_qkv.weight", 10240, 5120));
+    try std.testing.expect(!isQwen35SsmGateQ4kTarget(qwen35_27b_cfg, "blk.0.attn_gate.weight", 4096, 5120));
     try std.testing.expect(isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_gate.weight", 17408, 5120));
     try std.testing.expect(isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_up.weight", 17408, 5120));
     try std.testing.expect(!isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
