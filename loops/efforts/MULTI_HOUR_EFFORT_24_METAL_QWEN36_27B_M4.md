@@ -243,6 +243,46 @@ Harness follow-ups before publishing:
    `qwen36-27b-q4k-m` on the committed tree and report the conservative median,
    not the single best cycle.
 
+## Post-cycle-100 outcome
+
+The 100-cycle run finished with no additional runtime keeps after cycle 81.
+The worktree was clean at `metal-loop: pre-cycle-100`; cycle 100's fixed-K5120
+fused Q4 gate/up+SwiGLU candidate built and tested, but measured only
+`14.49 decode tok/s` and was reverted by the harness.
+
+Committed useful artifacts from the tail of the run:
+
+- Runtime best checkpoint: cycle 80 `ea522741` at `15.0917 decode tok/s`
+  routes exact Qwen3.6 27B Q4_K/Q4_K SSM `attn_qkv.weight` +
+  `attn_gate.weight` through the Q4 dual-row dispatch.
+- Runtime follow-up: cycle 81 `e9e83050` routes exact dense Q4_K
+  `ffn_gate.weight` + `ffn_up.weight` through the same dispatch and reduces
+  dispatch count, but is effectively flat at `15.0869 decode tok/s`.
+- Harness correctness: `d2b57ac1` fixes generated-token parsing so prompt
+  prose such as "generated 160 tokens" is no longer mistaken for engine timing.
+- Evidence enablement: `790ba581` adds `qwen27b_decode_hot` exact-shape Metal
+  benchmark cases for dense Q4 gate/up, Q6 down, SSM qkv/gate/out, and LM head.
+- Analysis checkpoints: `cb51dc4b` and `188f26aa` document the dense-decode
+  plateau and the required revalidation gate.
+
+Deep analysis after cycles 82-100:
+
+1. The current runtime algorithm is bandwidth-bound in dense FFN kernels, not
+   blocked primarily on CPU encode or command-buffer count. Cycle 81 reduced
+   dense gate/up dispatch count without moving decode speed.
+2. The reverted families cover the obvious local variants: Q4 dual
+   vectorization, fixed-K5120 Q4/Q6 pair routes, SSM pair specialization,
+   dense-down tail/barrier tweaks, copied dense weights, and fused dense
+   gate/up+SwiGLU. Do not reopen those without exact-shape evidence.
+3. The harness is too strict for evidence-only work and too trusting of a
+   persisted best. It should revalidate saved best trees on resume, preserve
+   labeled `analysis`/`enablement` artifacts, and run the new exact-shape
+   benchmark pass automatically before asking for another shader retune.
+4. The next productive step is not another blind runtime edit. First run the
+   full public M4 suite and the exact-shape benchmark on the kept tree; then
+   only change production code if that packet names a concrete dense Q4 gate/up
+   or Q6 down kernel route that beats the current path.
+
 ## First-cycle checklist
 
 Before editing:

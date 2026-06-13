@@ -75,6 +75,37 @@ Without that evidence, the llama.cpp techniques studied here
 the ZINC candidates, and vLLM `fused_moe` packing remains out of scope for this
 dense no-expert decode target.
 
+### Effort 24 post-cycle-100 conclusion
+
+Cycles 82-100 did not produce another keep. The final candidate, a fixed-K5120
+fused Q4 gate/up+SwiGLU path for the exact dense FFN shape, built and passed the
+unit suite but verified at about 14.49 tok/s and was reverted. That closes the
+local-retune phase: the obvious adaptations of llama.cpp row-pair mat-vec,
+ZINC's Q4/Q6 fixed-shape selectors, barrier narrowing, dense weight
+materialization, and dense activation fusion have all been tried or represented
+by kept commits.
+
+The harness gap is now part of the performance problem:
+
+- Resume state keeps the 15.09 tok/s promoted best as a threshold even when the
+  resumed live tree repeatedly measures around 14.7 tok/s. The harness should
+  revalidate `bestTree` after resume before using it as a hard acceptance band.
+- Analysis and enablement work can still be reverted by the throughput gate,
+  which makes exact-shape evidence fragile. Labeled `analysis` and
+  `enablement` steps need a non-throughput preservation path, or the loop will
+  keep rediscovering the same failed kernel families.
+- Effort 24 needs first-class Qwen3.6 27B dense-decode plateau guidance in
+  `loops/implement_metal.ts`, parallel to the existing Gemma/Qwen35 guidance:
+  after repeated reverts, require a public-suite revalidation packet or
+  exact-shape Metal benchmark evidence before another default-on runtime edit.
+
+The next credible performance attempt should start with evidence, not code:
+run the public M4 suite on the kept tree, run `qwen27b_decode_hot` exact-shape
+benchmarks, and compare dense Q4 gate/up and Q6 down production paths against
+any proposed replacement. If those numbers do not identify a kernel that beats
+the current route, publish the conservative revalidated median and move effort
+to a different M4 gap.
+
 ## Architecture Detection
 
 RDNA4 (gfx1201) is classified as `AMD_RDNA3` — no RDNA4-specific enum exists.
