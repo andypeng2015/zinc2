@@ -1235,6 +1235,12 @@ pub const RuntimeProfile = struct {
     decode_async_final_waits: u32 = 0,
     decode_async_final_pending_cmds: u32 = 0,
     decode_async_final_wait_ns: u64 = 0,
+    decode_async_submitted_dispatch_calls: u32 = 0,
+    decode_async_submitted_barrier_calls: u32 = 0,
+    decode_async_submitted_resource_barrier_resources: u32 = 0,
+    decode_async_final_dispatch_calls: u32 = 0,
+    decode_async_final_barrier_calls: u32 = 0,
+    decode_async_final_resource_barrier_resources: u32 = 0,
     sample_ns: u64 = 0,
     total_step_ns: u64 = 0,
     debug_validation_ns: u64 = 0,
@@ -1902,6 +1908,12 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.decode_async_final_waits = total.decode_async_final_waits -| prefix.decode_async_final_waits;
     delta.decode_async_final_pending_cmds = total.decode_async_final_pending_cmds -| prefix.decode_async_final_pending_cmds;
     delta.decode_async_final_wait_ns = total.decode_async_final_wait_ns -| prefix.decode_async_final_wait_ns;
+    delta.decode_async_submitted_dispatch_calls = total.decode_async_submitted_dispatch_calls -| prefix.decode_async_submitted_dispatch_calls;
+    delta.decode_async_submitted_barrier_calls = total.decode_async_submitted_barrier_calls -| prefix.decode_async_submitted_barrier_calls;
+    delta.decode_async_submitted_resource_barrier_resources = total.decode_async_submitted_resource_barrier_resources -| prefix.decode_async_submitted_resource_barrier_resources;
+    delta.decode_async_final_dispatch_calls = total.decode_async_final_dispatch_calls -| prefix.decode_async_final_dispatch_calls;
+    delta.decode_async_final_barrier_calls = total.decode_async_final_barrier_calls -| prefix.decode_async_final_barrier_calls;
+    delta.decode_async_final_resource_barrier_resources = total.decode_async_final_resource_barrier_resources -| prefix.decode_async_final_resource_barrier_resources;
     delta.sample_ns = total.sample_ns -| prefix.sample_ns;
     delta.total_step_ns = total.total_step_ns -| prefix.total_step_ns;
     delta.debug_validation_ns = total.debug_validation_ns -| prefix.debug_validation_ns;
@@ -2065,6 +2077,45 @@ fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
             profile.decode_async_queue_waits,
             avg_queue_pending,
             nsToMs(profile.decode_async_queue_wait_ns),
+        });
+        const avg_submit_dispatch = if (profile.decode_async_submits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_submitted_dispatch_calls)) / @as(f64, @floatFromInt(profile.decode_async_submits))
+        else
+            0.0;
+        const avg_submit_barriers = if (profile.decode_async_submits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_submitted_barrier_calls)) / @as(f64, @floatFromInt(profile.decode_async_submits))
+        else
+            0.0;
+        const avg_submit_resource_entries = if (profile.decode_async_submits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_submitted_resource_barrier_resources)) / @as(f64, @floatFromInt(profile.decode_async_submits))
+        else
+            0.0;
+        const avg_final_dispatch = if (profile.decode_async_final_waits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_final_dispatch_calls)) / @as(f64, @floatFromInt(profile.decode_async_final_waits))
+        else
+            0.0;
+        const avg_final_barriers = if (profile.decode_async_final_waits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_final_barrier_calls)) / @as(f64, @floatFromInt(profile.decode_async_final_waits))
+        else
+            0.0;
+        const avg_final_resource_entries = if (profile.decode_async_final_waits > 0)
+            @as(f64, @floatFromInt(profile.decode_async_final_resource_barrier_resources)) / @as(f64, @floatFromInt(profile.decode_async_final_waits))
+        else
+            0.0;
+        log.info("  {s} async decode work: submitted dispatch {d} barriers {d} resource-entries {d} avg/submit {d:.1}/{d:.1}/{d:.1} | final dispatch {d} barriers {d} resource-entries {d} avg/final {d:.1}/{d:.1}/{d:.1}", .{
+            label,
+            profile.decode_async_submitted_dispatch_calls,
+            profile.decode_async_submitted_barrier_calls,
+            profile.decode_async_submitted_resource_barrier_resources,
+            avg_submit_dispatch,
+            avg_submit_barriers,
+            avg_submit_resource_entries,
+            profile.decode_async_final_dispatch_calls,
+            profile.decode_async_final_barrier_calls,
+            profile.decode_async_final_resource_barrier_resources,
+            avg_final_dispatch,
+            avg_final_barriers,
+            avg_final_resource_entries,
         });
     }
     log.info("  {s} moe finalizers: scalar+norm {d} scalar {d} f32+seed+norm {d} f32+norm {d} f32 {d} shared {d} routed {d} | gemma weighted+post {d} post {d} staged {d}", .{
@@ -22168,12 +22219,18 @@ fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
 }
 
 fn commitFinalCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile, pending_count: usize) void {
+    const final_dispatch_calls = cmd.dispatch_count;
+    const final_barrier_calls = cmd.barrier_count;
+    const final_resource_barrier_resources = cmd.resource_barrier_resources;
     const wait_ns = commitAndWaitProfiledMeasured(cmd, profile);
     if (pending_count == 0) return;
     if (profile) |p| {
         p.decode_async_final_waits += 1;
         p.decode_async_final_pending_cmds += saturatingU32FromUsize(pending_count);
         p.decode_async_final_wait_ns += wait_ns;
+        p.decode_async_final_dispatch_calls += final_dispatch_calls;
+        p.decode_async_final_barrier_calls += final_barrier_calls;
+        p.decode_async_final_resource_barrier_resources += final_resource_barrier_resources;
     }
 }
 
@@ -22248,6 +22305,11 @@ fn submitPendingDenseCommand(
         waitPendingDenseCommands(pending_cmds, pending_count, profile);
     }
 
+    if (profile) |p| {
+        p.decode_async_submitted_dispatch_calls += cmd.dispatch_count;
+        p.decode_async_submitted_barrier_calls += cmd.barrier_count;
+        p.decode_async_submitted_resource_barrier_resources += cmd.resource_barrier_resources;
+    }
     commitAsyncProfiled(cmd, profile);
     if (profile) |p| {
         p.decode_async_submits += 1;
@@ -30625,6 +30687,12 @@ test "DMMV hot-shape profile keeps dense gate and up separate" {
 
 test "profile split preserves SSM and dense tail phase counters" {
     const prefix = RuntimeProfile{
+        .decode_async_submitted_dispatch_calls = 90,
+        .decode_async_submitted_barrier_calls = 80,
+        .decode_async_submitted_resource_barrier_resources = 70,
+        .decode_async_final_dispatch_calls = 60,
+        .decode_async_final_barrier_calls = 50,
+        .decode_async_final_resource_barrier_resources = 40,
         .ssm_barrier_calls = 11,
         .ssm_proj_norm_barrier_calls = 1,
         .ssm_qkv_barrier_calls = 2,
@@ -30657,6 +30725,12 @@ test "profile split preserves SSM and dense tail phase counters" {
         .dense_ffn_tail_final_norm_calls = 17,
     };
     const total = RuntimeProfile{
+        .decode_async_submitted_dispatch_calls = 900,
+        .decode_async_submitted_barrier_calls = 800,
+        .decode_async_submitted_resource_barrier_resources = 700,
+        .decode_async_final_dispatch_calls = 600,
+        .decode_async_final_barrier_calls = 500,
+        .decode_async_final_resource_barrier_resources = 400,
         .ssm_barrier_calls = 41,
         .ssm_proj_norm_barrier_calls = 11,
         .ssm_qkv_barrier_calls = 22,
@@ -30690,6 +30764,12 @@ test "profile split preserves SSM and dense tail phase counters" {
     };
 
     const delta = profileDeltaForSplit(total, prefix);
+    try std.testing.expectEqual(@as(u32, 810), delta.decode_async_submitted_dispatch_calls);
+    try std.testing.expectEqual(@as(u32, 720), delta.decode_async_submitted_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 630), delta.decode_async_submitted_resource_barrier_resources);
+    try std.testing.expectEqual(@as(u32, 540), delta.decode_async_final_dispatch_calls);
+    try std.testing.expectEqual(@as(u32, 450), delta.decode_async_final_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 360), delta.decode_async_final_resource_barrier_resources);
     try std.testing.expectEqual(@as(u32, 30), delta.ssm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 10), delta.ssm_proj_norm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 20), delta.ssm_qkv_barrier_calls);
