@@ -1412,6 +1412,7 @@ pub const RuntimeProfile = struct {
     decode_async_slot_resource_barrier_resources: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
     decode_async_slot_completed_cmds: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
     decode_async_slot_gpu_ns: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_encode_ns: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_layer_range_submits: [decode_async_profile_slots]u32 = [_]u32{0} ** decode_async_profile_slots,
     decode_async_slot_layer_start_sum: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_layer_end_sum: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
@@ -2274,6 +2275,7 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
         delta.decode_async_slot_resource_barrier_resources[idx] = total.decode_async_slot_resource_barrier_resources[idx] -| prefix.decode_async_slot_resource_barrier_resources[idx];
         delta.decode_async_slot_completed_cmds[idx] = total.decode_async_slot_completed_cmds[idx] -| prefix.decode_async_slot_completed_cmds[idx];
         delta.decode_async_slot_gpu_ns[idx] = total.decode_async_slot_gpu_ns[idx] -| prefix.decode_async_slot_gpu_ns[idx];
+        delta.decode_async_slot_encode_ns[idx] = total.decode_async_slot_encode_ns[idx] -| prefix.decode_async_slot_encode_ns[idx];
         delta.decode_async_slot_layer_range_submits[idx] = total.decode_async_slot_layer_range_submits[idx] -| prefix.decode_async_slot_layer_range_submits[idx];
         delta.decode_async_slot_layer_start_sum[idx] = total.decode_async_slot_layer_start_sum[idx] -| prefix.decode_async_slot_layer_start_sum[idx];
         delta.decode_async_slot_layer_end_sum[idx] = total.decode_async_slot_layer_end_sum[idx] -| prefix.decode_async_slot_layer_end_sum[idx];
@@ -2785,7 +2787,7 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
         const submits = profile.decode_async_slot_submits[slot];
         if (submits == 0) continue;
         if (!emitted_header) {
-            log.info("  {s} async decode chunk slots: slot submits avg_layers attn/ssm/dense avg_dispatch avg_barriers avg_resource_entries avg_gpu_ms avg_GiB attn/ssm-proj/ssm-out/dense", .{label});
+            log.info("  {s} async decode chunk slots: slot submits avg_layers attn/ssm/dense avg_dispatch avg_barriers avg_resource_entries avg_encode_ms avg_gpu_ms avg_GiB attn/ssm-proj/ssm-out/dense", .{label});
             emitted_header = true;
         }
         const completed = profile.decode_async_slot_completed_cmds[slot];
@@ -2795,7 +2797,7 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
             slowest_slot = slot;
             slowest_gpu_ms = gpu_ms;
         }
-        log.info("  {s} async decode chunk slot {d}: {d} [{d:.1},{d:.1}) {d:.1}/{d:.1}/{d:.1} {d:.1} {d:.1} {d:.1} {d:.3} {d:.2}/{d:.2}/{d:.2}/{d:.2}", .{
+        log.info("  {s} async decode chunk slot {d}: {d} [{d:.1},{d:.1}) {d:.1}/{d:.1}/{d:.1} {d:.1} {d:.1} {d:.1} {d:.3} {d:.3} {d:.2}/{d:.2}/{d:.2}/{d:.2}", .{
             label,
             slot,
             submits,
@@ -2807,6 +2809,7 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
             avgCount(profile.decode_async_slot_dispatch_calls[slot], submits),
             avgCount(profile.decode_async_slot_barrier_calls[slot], submits),
             avgCount(profile.decode_async_slot_resource_barrier_resources[slot], submits),
+            avgMs(profile.decode_async_slot_encode_ns[slot], submits),
             avgMs(profile.decode_async_slot_gpu_ns[slot], completed),
             avgGiB(profile.decode_async_slot_full_attn_bytes[slot], layer_submits),
             avgGiB(profile.decode_async_slot_ssm_projection_bytes[slot], layer_submits),
@@ -2962,11 +2965,12 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
             profile.decode_async_slot_ssm_projection_bytes[slot] +
             profile.decode_async_slot_ssm_out_bytes[slot] +
             profile.decode_async_slot_dense_ffn_bytes[slot];
-        log.info("  {s} async decode chunk bottleneck: slowest_slot {d} [{d:.1},{d:.1}) avg_gpu_ms {d:.3} avg_total_GiB {d:.2} eff_GiB/s {d:.1} dense_bytes {d:.1}% dispatch/barriers {d:.1}/{d:.1}", .{
+        log.info("  {s} async decode chunk bottleneck: slowest_slot {d} [{d:.1},{d:.1}) avg_encode_ms {d:.3} avg_gpu_ms {d:.3} avg_total_GiB {d:.2} eff_GiB/s {d:.1} dense_bytes {d:.1}% dispatch/barriers {d:.1}/{d:.1}", .{
             label,
             slot,
             avgCount64(profile.decode_async_slot_layer_start_sum[slot], layer_submits),
             avgCount64(profile.decode_async_slot_layer_end_sum[slot], layer_submits),
+            avgMs(profile.decode_async_slot_encode_ns[slot], submits),
             slowest_gpu_ms,
             avgGiB(total_bytes, layer_submits),
             bytesPerSecondGiB(total_bytes, profile.decode_async_slot_gpu_ns[slot]),
@@ -23541,6 +23545,18 @@ fn recordDecodeAsyncSlotBarrierPhases(
     );
 }
 
+fn decodeAsyncEncodeNsDelta(total: RuntimeProfile, prefix: RuntimeProfile) u64 {
+    // Mirrors llama.cpp `ggml_metal_graph_compute`'s split between graph
+    // encoding and queued command-buffer execution: these counters cover the
+    // CPU-side dispatch/barrier recording work that happened while building a
+    // chunk, while `decode_async_slot_gpu_ns` comes from Metal's GPU timestamps.
+    return (total.layer_record_ns -| prefix.layer_record_ns) +
+        (total.gpu_routed_moe_record_ns -| prefix.gpu_routed_moe_record_ns) +
+        (total.fallback_moe_record_ns -| prefix.fallback_moe_record_ns) +
+        (total.dense_ffn_record_ns -| prefix.dense_ffn_record_ns) +
+        (total.final_record_ns -| prefix.final_record_ns);
+}
+
 fn submitPendingDenseCommand(
     cmd: *MetalCommand,
     engine: *const InferenceEngine,
@@ -23568,7 +23584,10 @@ fn submitPendingDenseCommand(
         p.decode_async_slot_resource_barrier_resources[slot] += cmd.resource_barrier_resources;
         recordDecodeAsyncSlotLayerRange(p, cfg, slot, layer_start, layer_end);
         recordDecodeAsyncSlotLayerBytes(p, engine, slot, layer_start, layer_end);
-        if (profile_prefix) |prefix| recordDecodeAsyncSlotBarrierPhases(p, slot, prefix.*);
+        if (profile_prefix) |prefix| {
+            recordDecodeAsyncSlotBarrierPhases(p, slot, prefix.*);
+            p.decode_async_slot_encode_ns[slot] += decodeAsyncEncodeNsDelta(p.*, prefix.*);
+        }
     }
     commitAsyncProfiled(cmd, profile);
     if (profile) |p| {
@@ -32056,6 +32075,7 @@ test "profile split preserves SSM and dense tail phase counters" {
     prefix.decode_async_slot_resource_barrier_resources[0] = 16;
     prefix.decode_async_slot_completed_cmds[0] = 2;
     prefix.decode_async_slot_gpu_ns[0] = 2_000_000;
+    prefix.decode_async_slot_encode_ns[0] = 1_000_000;
     prefix.decode_async_slot_layer_range_submits[0] = 2;
     prefix.decode_async_slot_layer_start_sum[0] = 4;
     prefix.decode_async_slot_layer_end_sum[0] = 20;
@@ -32082,6 +32102,7 @@ test "profile split preserves SSM and dense tail phase counters" {
     prefix.decode_async_slot_resource_barrier_resources[1] = 27;
     prefix.decode_async_slot_completed_cmds[1] = 3;
     prefix.decode_async_slot_gpu_ns[1] = 6_000_000;
+    prefix.decode_async_slot_encode_ns[1] = 3_000_000;
     prefix.decode_async_slot_layer_range_submits[1] = 3;
     prefix.decode_async_slot_layer_start_sum[1] = 72;
     prefix.decode_async_slot_layer_end_sum[1] = 96;
@@ -32147,6 +32168,7 @@ test "profile split preserves SSM and dense tail phase counters" {
     total.decode_async_slot_resource_barrier_resources[0] = 56;
     total.decode_async_slot_completed_cmds[0] = 7;
     total.decode_async_slot_gpu_ns[0] = 9_000_000;
+    total.decode_async_slot_encode_ns[0] = 4_000_000;
     total.decode_async_slot_layer_range_submits[0] = 7;
     total.decode_async_slot_layer_start_sum[0] = 44;
     total.decode_async_slot_layer_end_sum[0] = 100;
@@ -32173,6 +32195,7 @@ test "profile split preserves SSM and dense tail phase counters" {
     total.decode_async_slot_resource_barrier_resources[1] = 99;
     total.decode_async_slot_completed_cmds[1] = 11;
     total.decode_async_slot_gpu_ns[1] = 23_000_000;
+    total.decode_async_slot_encode_ns[1] = 10_000_000;
     total.decode_async_slot_layer_range_submits[1] = 11;
     total.decode_async_slot_layer_start_sum[1] = 200;
     total.decode_async_slot_layer_end_sum[1] = 288;
@@ -32207,6 +32230,7 @@ test "profile split preserves SSM and dense tail phase counters" {
     try std.testing.expectEqual(@as(u32, 40), delta.decode_async_slot_resource_barrier_resources[0]);
     try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_completed_cmds[0]);
     try std.testing.expectEqual(@as(u64, 7_000_000), delta.decode_async_slot_gpu_ns[0]);
+    try std.testing.expectEqual(@as(u64, 3_000_000), delta.decode_async_slot_encode_ns[0]);
     try std.testing.expectEqual(@as(u32, 5), delta.decode_async_slot_layer_range_submits[0]);
     try std.testing.expectEqual(@as(u64, 40), delta.decode_async_slot_layer_start_sum[0]);
     try std.testing.expectEqual(@as(u64, 80), delta.decode_async_slot_layer_end_sum[0]);
@@ -32239,6 +32263,7 @@ test "profile split preserves SSM and dense tail phase counters" {
     try std.testing.expectEqual(@as(u32, 72), delta.decode_async_slot_resource_barrier_resources[1]);
     try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_completed_cmds[1]);
     try std.testing.expectEqual(@as(u64, 17_000_000), delta.decode_async_slot_gpu_ns[1]);
+    try std.testing.expectEqual(@as(u64, 7_000_000), delta.decode_async_slot_encode_ns[1]);
     try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_layer_range_submits[1]);
     try std.testing.expectEqual(@as(u64, 128), delta.decode_async_slot_layer_start_sum[1]);
     try std.testing.expectEqual(@as(u64, 192), delta.decode_async_slot_layer_end_sum[1]);
