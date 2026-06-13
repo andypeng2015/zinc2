@@ -705,6 +705,18 @@ fn defaultQwen36SsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
         cfg.ssm_n_group == 16;
 }
 
+fn defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg: ModelConfig) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        cfg.n_layers == 64 and
+        cfg.n_experts == 0 and
+        cfg.ssm_d_inner == 6144 and
+        cfg.ssm_d_state == 128 and
+        cfg.ssm_dt_rank == 48 and
+        cfg.ssm_n_group == 16;
+}
+
 fn defaultFusedSsmNormEnabled(cfg: ModelConfig) bool {
     // llama.cpp keeps norm as a separate graph op before the Metal matmul
     // kernels. For the Qwen3.6 35B SSM shape, fusing RMSNorm into per-row Q8
@@ -746,7 +758,7 @@ fn ssmDeltaGatedNormThreadgroupSize(
     d_state: u32,
     n_group: u32,
 ) u32 {
-    if (dt_rank == 32 and
+    if ((dt_rank == 32 or dt_rank == 48) and
         head_v_dim == 128 and
         d_state == 128 and
         n_group == 16 and
@@ -5000,7 +5012,8 @@ pub const InferenceEngine = struct {
         self.fused_ssm_norm_enabled = readBoolEnv("ZINC_METAL_FUSED_SSM_NORM") orelse defaultFusedSsmNormEnabled(cfg);
         self.fused_ssm_delta_gated_norm_enabled =
             readBoolEnv("ZINC_METAL_FUSED_SSM_DELTA_GATED_NORM") orelse
-            defaultQwen36SsmPrefillProjectionEnabled(cfg);
+            (defaultQwen36SsmPrefillProjectionEnabled(cfg) or
+                defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg));
         self.qwen_ssm_delta_gated_norm_exact_enabled =
             readBoolEnv("ZINC_METAL_QWEN_SSM_DELTA_GATED_NORM_EXACT") orelse
             defaultQwen36SsmPrefillProjectionEnabled(cfg);
@@ -26685,6 +26698,7 @@ test "qwen ssm delta gated norm threadgroup helper uses tg128 exact model shape"
     };
 
     try std.testing.expectEqual(@as(u32, 128), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 128, 128, 16));
+    try std.testing.expectEqual(@as(u32, 128), ssmDeltaGatedNormThreadgroupSize(&pipe, 48, 128, 128, 16));
     try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 16, 128, 128, 16));
     try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 64, 128, 16));
     try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 128, 64, 16));
@@ -29864,6 +29878,7 @@ test "q6k simdgroup route covers qwen35 27b exact shapes" {
     try std.testing.expect(supportsDenseQ6kSimdgroupDmmvArch(.qwen2));
     try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen35));
     try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen2_moe));
+    try std.testing.expect(defaultQwen35Dense27bSsmDeltaGatedNormEnabled(qwen35_27b_cfg));
     try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
     try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.attn_qkv.weight", 10240, 5120));
     try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.attn_gate.weight", 6144, 5120));
