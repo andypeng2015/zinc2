@@ -265,6 +265,10 @@ const qwen35_27b_dense_down_q6k_blocks: u32 = 68; // 17408 / QK_K
 const qwen35_27b_dense_gate_up_q4k_blocks: u32 = 20; // 5120 / QK_K
 const qwen35_27b_dense_down_q4k_blocks: u32 = 68; // 17408 / QK_K
 
+fn qwen35SsmQkvRows(cfg: ModelConfig) u32 {
+    return cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
+}
+
 fn isQwen35DenseDownQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
     return cfg.architecture == .qwen35 and
         cfg.hidden_dim == 5120 and
@@ -273,6 +277,20 @@ fn isQwen35DenseDownQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32,
         K == cfg.intermediate_dim and
         K == qwen35_27b_dense_down_q6k_blocks * 256 and
         std.mem.endsWith(u8, tensor_name, "ffn_down.weight");
+}
+
+fn isQwen35SsmQkvQ6kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
+    return cfg.architecture == .qwen35 and
+        cfg.hidden_dim == 5120 and
+        cfg.intermediate_dim == 17408 and
+        cfg.ssm_d_inner == 6144 and
+        cfg.ssm_d_state == 128 and
+        cfg.ssm_dt_rank == 48 and
+        cfg.ssm_n_group == 16 and
+        M == qwen35SsmQkvRows(cfg) and
+        K == cfg.hidden_dim and
+        K == qwen35_27b_dense_gate_up_q4k_blocks * 256 and
+        std.mem.endsWith(u8, tensor_name, "attn_qkv.weight");
 }
 
 fn isQwen35DenseGateUpQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
@@ -299,7 +317,8 @@ fn isQwen35DenseDownQ4kTarget(cfg: ModelConfig, tensor_name: []const u8, M: u32,
 fn canUseDenseQ6kSimdgroupDmmvShape(cfg: ModelConfig, tensor_name: []const u8, M: u32, K: u32) bool {
     if (cfg.n_experts != 0 or M == 0 or M % 4 != 0 or K % 256 != 0) return false;
     return supportsDenseQ6kSimdgroupDmmvArch(cfg.architecture) or
-        isQwen35DenseDownQ6kTarget(cfg, tensor_name, M, K);
+        isQwen35DenseDownQ6kTarget(cfg, tensor_name, M, K) or
+        isQwen35SsmQkvQ6kTarget(cfg, tensor_name, M, K);
 }
 
 fn preferApple9Q8K2048Path(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
@@ -29817,7 +29836,7 @@ test "global q8 override skips gemma shared expert q8 tensors" {
     try std.testing.expect(shouldUseGlobalQ8Override(.qwen35, "blk.0.ffn_down.weight"));
 }
 
-test "dense q6k simdgroup route covers qwen35 27b down exact shape" {
+test "q6k simdgroup route covers qwen35 27b exact shapes" {
     const qwen35_27b_cfg = ModelConfig{
         .architecture = .qwen35,
         .n_layers = 64,
@@ -29846,7 +29865,9 @@ test "dense q6k simdgroup route covers qwen35 27b down exact shape" {
     try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen35));
     try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen2_moe));
     try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
-    try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ssm_out.weight", 10240, 5120));
+    try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.attn_qkv.weight", 10240, 5120));
+    try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.attn_gate.weight", 6144, 5120));
+    try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ssm_out.weight", 5120, 6144));
     try std.testing.expect(!canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "output.weight", 248320, 5120));
     try std.testing.expect(isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_gate.weight", 17408, 5120));
     try std.testing.expect(isQwen35DenseGateUpQ4kTarget(qwen35_27b_cfg, "blk.0.ffn_up.weight", 17408, 5120));
