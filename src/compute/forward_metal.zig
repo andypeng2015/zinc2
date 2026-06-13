@@ -735,9 +735,9 @@ fn hybridDecodeCommandGroupLayers(cfg: ModelConfig) usize {
     if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
         // One layer per command buffer leaves Qwen3.6 27B with 64 async submits
         // per token. llama.cpp's `ggml_metal_graph_compute` keeps graph work in
-        // a small queued command-buffer set; group one 3xSSM+1xattn block while
+        // a small queued command-buffer set; group two 3xSSM+1xattn blocks while
         // avoiding the previously failed whole-token command buffer.
-        return 4;
+        return 8;
     }
     return 1;
 }
@@ -30155,7 +30155,7 @@ test "q6k simdgroup route covers qwen35 27b exact shapes" {
     try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen35));
     try std.testing.expect(!supportsDenseQ6kSimdgroupDmmvArch(.qwen2_moe));
     try std.testing.expect(defaultQwen35Dense27bSsmDeltaGatedNormEnabled(qwen35_27b_cfg));
-    try std.testing.expectEqual(@as(usize, 4), hybridDecodeCommandGroupLayers(qwen35_27b_cfg));
+    try std.testing.expectEqual(@as(usize, 8), hybridDecodeCommandGroupLayers(qwen35_27b_cfg));
     try std.testing.expect(qwenSsmDeltaGatedNormExactShape(qwen35_27b_cfg, 48, 128, 128, 16));
     try std.testing.expect(!qwenSsmDeltaGatedNormExactShape(qwen35_27b_cfg, 32, 128, 128, 16));
     try std.testing.expect(canUseDenseQ6kSimdgroupDmmvShape(qwen35_27b_cfg, "blk.0.ffn_down.weight", 5120, 17408));
