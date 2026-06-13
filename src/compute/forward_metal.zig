@@ -22937,7 +22937,7 @@ fn runDecodeStep(
                     // after the conv/tail join there is no independent queued
                     // work left to preserve, so use the cheaper buffer-scope
                     // encoder barrier instead of building a one-resource array.
-                    profileSsmBarrierBuffers(cmd, profile, .gated_norm, &.{&engine.attn_out_buf});
+                    profileSsmBarrier(cmd, profile, .gated_norm);
                 } else {
                     // Delta-net: swiglu_buf → attn_out_buf
                     {
@@ -23025,7 +23025,9 @@ fn runDecodeStep(
                 dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, ssm_activation_buf, &engine.down_buf, hidden_dim, d_inner, 0);
                 // The residual/router step only depends on the SSM projection
                 // row, and no unrelated SSM work remains queued at this edge.
-                profileSsmBarrierBuffers(cmd, profile, .out, &.{&engine.down_buf});
+                // Match llama.cpp's reset path with a scope barrier instead of
+                // paying one-resource setup for every Qwen27 SSM layer.
+                profileSsmBarrier(cmd, profile, .out);
                 if (should_debug_ssm_compare) {
                     commitAndWaitProfiled(cmd, profile);
                     const debug_start = profileStart(profile != null);
