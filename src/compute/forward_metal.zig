@@ -25561,12 +25561,16 @@ fn runDecodeStep(
                         try validateQwen35DenseQ4KGateUpSwiGLUOnCmd(engine, cmd, profile, layer_idx, gate_t, up_t, &engine.norm_buf, inter_dim, hidden_dim);
                     }
                 }
-                // Dense-down consumes only the activation row, and no
-                // independent dense work remains queued at this edge. Match
-                // llama.cpp's `ggml_metal_op_concurrency_reset` shape here:
-                // use a scope barrier instead of one-resource setup, while
-                // keeping the earlier gate/up join resource-scoped.
-                profileDenseFfnBarrier(cmd, profile, .activation);
+                // Dense-down consumes only the activation row. On the Qwen3.6
+                // 27B hybrid path, this command buffer also carries SSM/full-attn
+                // work from the same small layer group, so adapt llama.cpp
+                // `ggml_metal_op_concurrency_check/reset`: fence only the
+                // single consumer resource instead of flushing unrelated writes.
+                if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) {
+                    profileDenseFfnBarrierBuffers(cmd, profile, .activation, &.{&engine.swiglu_buf});
+                } else {
+                    profileDenseFfnBarrier(cmd, profile, .activation);
+                }
 
                 const down_dispatch_before = cmd.dispatch_count;
                 dispatchDmmvOnCmd(engine, cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
