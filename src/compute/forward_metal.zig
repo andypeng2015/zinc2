@@ -931,6 +931,7 @@ const DmmvPipelineChoice = struct {
 
 const Q8ShapeStat = struct {
     path: DmmvPathClass = .other,
+    detail: DmmvDetailClass = .none,
     rows: u32 = 0,
     cols: u32 = 0,
     bytes: u64 = 0,
@@ -965,9 +966,9 @@ const Q8RepackedDispatchKind = enum(u8) {
 /// The coarse `q8_repacked_*_bytes/_calls` fields on `RuntimeProfile` group
 /// dispatches by the 4-bucket `Q8RepackedKernel` (tg128/exact_qwen/quad/
 /// generic) and the per-shape `q8_shape_stats` is keyed only by
-/// `DmmvPathClass` (lm_head/router/ssm/full_attn/etc.) — so a `q8 hot #N`
-/// line tells you a shape moves 17.93 GiB but NOT which of the 11 sibling
-/// shaders served it. This slot table fills that gap by keying on
+/// `DmmvPathClass` plus `DmmvDetailClass`; a `q8 hot #N` line tells you which
+/// logical edge moves bytes, but NOT which of the sibling shaders served it.
+/// This slot table fills that gap by keying on
 /// `(kind, rows, cols)` for the actual production dispatch path. Default-off
 /// alongside the rest of the runtime profile.
 const Q8RepackedDispatchStat = struct {
@@ -1613,6 +1614,7 @@ fn dmmvShapeStatMinusPrefix(total_slot: DmmvShapeStat, prefix_stats: []const Dmm
     for (prefix_stats) |slot| {
         if (slot.calls != 0 and
             slot.path == total_slot.path and
+            slot.detail == total_slot.detail and
             slot.rows == total_slot.rows and
             slot.cols == total_slot.cols)
         {
@@ -1627,6 +1629,7 @@ fn dmmvShapeStatMinusPrefix(total_slot: DmmvShapeStat, prefix_stats: []const Dmm
     if (bytes == 0 or calls == 0) return .{};
     return .{
         .path = total_slot.path,
+        .detail = total_slot.detail,
         .rows = total_slot.rows,
         .cols = total_slot.cols,
         .bytes = bytes,
@@ -2217,10 +2220,11 @@ fn logDmmvHotShapes(label: []const u8, stats: []const DmmvShapeStat) void {
     for (top_idxs, 0..) |maybe_idx, rank| {
         if (maybe_idx) |idx| {
             const slot = stats[idx];
-            log.info("  {s} hot #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
+            log.info("  {s} hot #{d}: {s}/{s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
                 label,
                 rank + 1,
                 dmmvPathLabel(slot.path),
+                dmmvDetailLabel(slot.detail),
                 slot.rows,
                 slot.cols,
                 bytesToGiB(slot.bytes),
@@ -8400,9 +8404,10 @@ pub const InferenceEngine = struct {
                 for (top_idxs, 0..) |maybe_idx, rank| {
                     if (maybe_idx) |idx| {
                         const slot = profile.q8_shape_stats[idx];
-                        log.info("  q8 hot #{d}: {s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
+                        log.info("  q8 hot #{d}: {s}/{s} M={d} K={d} bytes={d:.2} GiB calls={d}", .{
                             rank + 1,
                             dmmvPathLabel(slot.path),
+                            dmmvDetailLabel(slot.detail),
                             slot.rows,
                             slot.cols,
                             bytesToGiB(slot.bytes),
@@ -9209,22 +9214,24 @@ fn classifyDmmvPath(engine: *const InferenceEngine, tensor: *const metal_loader.
 fn recordQ8ShapeProfile(
     profile: *RuntimeProfile,
     path: DmmvPathClass,
+    detail: DmmvDetailClass,
     rows: u32,
     cols: u32,
     bytes: u64,
 ) void {
-    recordDmmvShapeProfile(profile.q8_shape_stats[0..], path, rows, cols, bytes);
+    recordDmmvShapeProfile(profile.q8_shape_stats[0..], path, detail, rows, cols, bytes);
 }
 
 fn recordDmmvShapeProfile(
     stats: []DmmvShapeStat,
     path: DmmvPathClass,
+    detail: DmmvDetailClass,
     rows: u32,
     cols: u32,
     bytes: u64,
 ) void {
     for (stats) |*slot| {
-        if (slot.calls != 0 and slot.path == path and slot.rows == rows and slot.cols == cols) {
+        if (slot.calls != 0 and slot.path == path and slot.detail == detail and slot.rows == rows and slot.cols == cols) {
             slot.bytes += bytes;
             slot.calls += 1;
             return;
@@ -9234,6 +9241,7 @@ fn recordDmmvShapeProfile(
         if (slot.calls == 0) {
             slot.* = .{
                 .path = path,
+                .detail = detail,
                 .rows = rows,
                 .cols = cols,
                 .bytes = bytes,
@@ -9348,11 +9356,12 @@ fn recordDmmvProfile(
         .moe_expert => profile.moe_expert_bytes += bytes,
         else => {},
     }
-    recordDetailedDmmvBytes(profile, classifyDmmvDetail(engine, tensor, path), bytes);
+    const detail = classifyDmmvDetail(engine, tensor, path);
+    recordDetailedDmmvBytes(profile, detail, bytes);
     switch (tensor.info.type_) {
-        .q4_k => recordDmmvShapeProfile(profile.q4k_shape_stats[0..], path, rows, cols, bytes),
-        .q6_k => recordDmmvShapeProfile(profile.q6k_shape_stats[0..], path, rows, cols, bytes),
-        .q8_0 => recordQ8ShapeProfile(profile, path, rows, cols, bytes),
+        .q4_k => recordDmmvShapeProfile(profile.q4k_shape_stats[0..], path, detail, rows, cols, bytes),
+        .q6_k => recordDmmvShapeProfile(profile.q6k_shape_stats[0..], path, detail, rows, cols, bytes),
+        .q8_0 => recordQ8ShapeProfile(profile, path, detail, rows, cols, bytes),
         else => {},
     }
 }
@@ -9370,9 +9379,10 @@ fn recordMoeDmmvProfile(
     var profile = &engine.request_profile;
     recordDispatchQuantBytes(profile, tensor.info.type_, bytes);
     profile.moe_expert_bytes += bytes;
-    recordDetailedDmmvBytes(profile, classifyDmmvDetail(engine, tensor, .moe_expert), bytes);
+    const detail = classifyDmmvDetail(engine, tensor, .moe_expert);
+    recordDetailedDmmvBytes(profile, detail, bytes);
     if (tensor.info.type_ == .q8_0) {
-        recordQ8ShapeProfile(profile, .moe_expert, rows, cols, bytes);
+        recordQ8ShapeProfile(profile, .moe_expert, detail, rows, cols, bytes);
     }
 }
 
@@ -30193,6 +30203,31 @@ test "dense FFN tensors populate detailed profile buckets" {
     try std.testing.expectEqual(DmmvDetailClass.dense_up, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_up.weight"));
     try std.testing.expectEqual(DmmvDetailClass.dense_down, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_down.weight"));
     try std.testing.expectEqual(DmmvDetailClass.none, classifyDmmvDetailUncached(.dense_ffn, "blk.0.ffn_gate_shexp.weight"));
+}
+
+test "DMMV hot-shape profile keeps dense gate and up separate" {
+    var stats: [4]DmmvShapeStat = [_]DmmvShapeStat{.{}} ** 4;
+
+    recordDmmvShapeProfile(stats[0..], .dense_ffn, .dense_gate, 17408, 5120, 10);
+    recordDmmvShapeProfile(stats[0..], .dense_ffn, .dense_up, 17408, 5120, 20);
+    recordDmmvShapeProfile(stats[0..], .dense_ffn, .dense_gate, 17408, 5120, 5);
+
+    try std.testing.expectEqual(DmmvPathClass.dense_ffn, stats[0].path);
+    try std.testing.expectEqual(DmmvDetailClass.dense_gate, stats[0].detail);
+    try std.testing.expectEqual(@as(u64, 15), stats[0].bytes);
+    try std.testing.expectEqual(@as(u32, 2), stats[0].calls);
+    try std.testing.expectEqual(DmmvDetailClass.dense_up, stats[1].detail);
+    try std.testing.expectEqual(@as(u64, 20), stats[1].bytes);
+    try std.testing.expectEqual(@as(u32, 1), stats[1].calls);
+
+    const prefix = [_]DmmvShapeStat{
+        .{ .path = .dense_ffn, .detail = .dense_gate, .rows = 17408, .cols = 5120, .bytes = 10, .calls = 1 },
+        .{ .path = .dense_ffn, .detail = .dense_up, .rows = 17408, .cols = 5120, .bytes = 20, .calls = 1 },
+    };
+    const delta = dmmvShapeStatMinusPrefix(stats[0], prefix[0..]);
+    try std.testing.expectEqual(DmmvDetailClass.dense_gate, delta.detail);
+    try std.testing.expectEqual(@as(u64, 5), delta.bytes);
+    try std.testing.expectEqual(@as(u32, 1), delta.calls);
 }
 
 test "q8 lm head stays on GPU" {
