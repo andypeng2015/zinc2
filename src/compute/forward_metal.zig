@@ -1128,6 +1128,11 @@ pub const RuntimeProfile = struct {
     dense_ffn_down_dispatch_calls: u32 = 0,
     dense_ffn_tail_dispatch_calls: u32 = 0,
     dense_ffn_scale_dispatch_calls: u32 = 0,
+    dense_ffn_tail_post_norm_dispatch_calls: u32 = 0,
+    dense_ffn_tail_post_norm_next_norm_calls: u32 = 0,
+    dense_ffn_tail_residual_next_norm_calls: u32 = 0,
+    dense_ffn_tail_residual_acc_calls: u32 = 0,
+    dense_ffn_tail_final_norm_calls: u32 = 0,
     dense_gemma_q4k_geglu_validation_checks: u32 = 0,
     dense_gemma_q4k_geglu_validation_status: DenseGemmaQ4KGeGLUValidationStatus = .none,
     dense_gemma_q4k_geglu_validation_tensor: DenseGemmaQ4KGeGLUValidationTensor = .none,
@@ -1730,6 +1735,11 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
     delta.dense_ffn_down_dispatch_calls = total.dense_ffn_down_dispatch_calls -| prefix.dense_ffn_down_dispatch_calls;
     delta.dense_ffn_tail_dispatch_calls = total.dense_ffn_tail_dispatch_calls -| prefix.dense_ffn_tail_dispatch_calls;
     delta.dense_ffn_scale_dispatch_calls = total.dense_ffn_scale_dispatch_calls -| prefix.dense_ffn_scale_dispatch_calls;
+    delta.dense_ffn_tail_post_norm_dispatch_calls = total.dense_ffn_tail_post_norm_dispatch_calls -| prefix.dense_ffn_tail_post_norm_dispatch_calls;
+    delta.dense_ffn_tail_post_norm_next_norm_calls = total.dense_ffn_tail_post_norm_next_norm_calls -| prefix.dense_ffn_tail_post_norm_next_norm_calls;
+    delta.dense_ffn_tail_residual_next_norm_calls = total.dense_ffn_tail_residual_next_norm_calls -| prefix.dense_ffn_tail_residual_next_norm_calls;
+    delta.dense_ffn_tail_residual_acc_calls = total.dense_ffn_tail_residual_acc_calls -| prefix.dense_ffn_tail_residual_acc_calls;
+    delta.dense_ffn_tail_final_norm_calls = total.dense_ffn_tail_final_norm_calls -| prefix.dense_ffn_tail_final_norm_calls;
     delta.final_barrier_calls = total.final_barrier_calls -| prefix.final_barrier_calls;
     delta.sample_calls = total.sample_calls -| prefix.sample_calls;
     delta.full_attn_layers = total.full_attn_layers -| prefix.full_attn_layers;
@@ -2190,6 +2200,14 @@ fn logSplitBarrierBreakdown(label: []const u8, profile: RuntimeProfile) void {
             profile.dense_ffn_down_dispatch_calls,
             profile.dense_ffn_tail_dispatch_calls,
             profile.dense_ffn_scale_dispatch_calls,
+        });
+        log.info("  {s} dense tail variants: post-norm {d} post+next-norm {d} residual+next-norm {d} residual-acc {d} final-norm {d}", .{
+            label,
+            profile.dense_ffn_tail_post_norm_dispatch_calls,
+            profile.dense_ffn_tail_post_norm_next_norm_calls,
+            profile.dense_ffn_tail_residual_next_norm_calls,
+            profile.dense_ffn_tail_residual_acc_calls,
+            profile.dense_ffn_tail_final_norm_calls,
         });
     }
 }
@@ -24083,6 +24101,10 @@ fn runDecodeStep(
                         hidden_dim,
                         hidden_scale,
                     );
+                    if (profile) |p| {
+                        p.dense_ffn_tail_post_norm_next_norm_calls += 1;
+                        if (can_fuse_final_norm_tail) p.dense_ffn_tail_final_norm_calls += 1;
+                    }
                     if (can_fuse_final_norm_tail) {
                         // Adapt llama.cpp `ggml_metal_op_concurrency_check`:
                         // LM head consumes only the materialized final norm row.
@@ -24108,6 +24130,7 @@ fn runDecodeStep(
                 } else {
                     if (engine.post_ffn_norm_present[layer_idx]) {
                         dispatchRmsNormOnCmd(engine, cmd, &engine.down_buf, &engine.down_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
+                        if (profile) |p| p.dense_ffn_tail_post_norm_dispatch_calls += 1;
                         profileDenseFfnBarrierBuffers(cmd, profile, .down, &.{&engine.down_buf});
                     }
 
@@ -24128,6 +24151,7 @@ fn runDecodeStep(
                                 1.0,
                                 hidden_scale,
                             );
+                            if (profile) |p| p.dense_ffn_tail_residual_next_norm_calls += 1;
                             prev_fused_attn_norm = true;
                             if (layer_scale_runs_after_dense) layer_output_scale_fused_into_post_norm = true;
                             if (!ends_dense_cmd_chunk) {
@@ -24146,6 +24170,7 @@ fn runDecodeStep(
                             const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
                             const acc_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.down_buf };
                             cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
+                            if (profile) |p| p.dense_ffn_tail_residual_acc_calls += 1;
                             if (!ends_dense_cmd_chunk or layer_scale_runs_after_dense) {
                                 profileDenseFfnBarrierBuffers(cmd, profile, .tail, &.{&engine.hidden_buf});
                             }
@@ -24162,6 +24187,7 @@ fn runDecodeStep(
                         const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
                         const acc_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.down_buf };
                         cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
+                        if (profile) |p| p.dense_ffn_tail_residual_acc_calls += 1;
                         submitPendingDenseCommand(cmd, dense_pending_cmds[0..], &dense_pending_count, profile);
                     } else {
                         commitAndWaitProfiled(cmd, profile);
@@ -30378,7 +30404,7 @@ test "DMMV hot-shape profile keeps dense gate and up separate" {
     try std.testing.expectEqual(@as(u32, 1), delta.calls);
 }
 
-test "profile split preserves SSM barrier phase counters" {
+test "profile split preserves SSM and dense tail phase counters" {
     const prefix = RuntimeProfile{
         .ssm_barrier_calls = 11,
         .ssm_proj_norm_barrier_calls = 1,
@@ -30389,6 +30415,11 @@ test "profile split preserves SSM barrier phase counters" {
         .ssm_gated_norm_barrier_calls = 6,
         .ssm_out_barrier_calls = 7,
         .ssm_residual_barrier_calls = 8,
+        .dense_ffn_tail_post_norm_dispatch_calls = 9,
+        .dense_ffn_tail_post_norm_next_norm_calls = 10,
+        .dense_ffn_tail_residual_next_norm_calls = 11,
+        .dense_ffn_tail_residual_acc_calls = 12,
+        .dense_ffn_tail_final_norm_calls = 13,
     };
     const total = RuntimeProfile{
         .ssm_barrier_calls = 41,
@@ -30400,6 +30431,11 @@ test "profile split preserves SSM barrier phase counters" {
         .ssm_gated_norm_barrier_calls = 66,
         .ssm_out_barrier_calls = 77,
         .ssm_residual_barrier_calls = 88,
+        .dense_ffn_tail_post_norm_dispatch_calls = 99,
+        .dense_ffn_tail_post_norm_next_norm_calls = 110,
+        .dense_ffn_tail_residual_next_norm_calls = 121,
+        .dense_ffn_tail_residual_acc_calls = 132,
+        .dense_ffn_tail_final_norm_calls = 143,
     };
 
     const delta = profileDeltaForSplit(total, prefix);
@@ -30412,6 +30448,11 @@ test "profile split preserves SSM barrier phase counters" {
     try std.testing.expectEqual(@as(u32, 60), delta.ssm_gated_norm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 70), delta.ssm_out_barrier_calls);
     try std.testing.expectEqual(@as(u32, 80), delta.ssm_residual_barrier_calls);
+    try std.testing.expectEqual(@as(u32, 90), delta.dense_ffn_tail_post_norm_dispatch_calls);
+    try std.testing.expectEqual(@as(u32, 100), delta.dense_ffn_tail_post_norm_next_norm_calls);
+    try std.testing.expectEqual(@as(u32, 110), delta.dense_ffn_tail_residual_next_norm_calls);
+    try std.testing.expectEqual(@as(u32, 120), delta.dense_ffn_tail_residual_acc_calls);
+    try std.testing.expectEqual(@as(u32, 130), delta.dense_ffn_tail_final_norm_calls);
 }
 
 test "q8 lm head stays on GPU" {
