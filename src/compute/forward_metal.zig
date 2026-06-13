@@ -815,11 +815,29 @@ fn canUseQwenSsmConvD4FastPath(
     d_conv: u32,
     kernel_is_f16: bool,
 ) bool {
-    return defaultQwen36SsmPrefillProjectionEnabled(engine.config) and
+    return qwenSsmConvD4DecodePipe(engine, conv_channels, d_conv, kernel_is_f16) != null;
+}
+
+fn qwenSsmConvD4DecodePipe(
+    engine: *const InferenceEngine,
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: bool,
+) ?*const MetalPipeline {
+    if (d_conv != 4 or kernel_is_f16) return null;
+    if (defaultQwen36SsmPrefillProjectionEnabled(engine.config) and
         conv_channels == 8192 and
-        d_conv == 4 and
-        !kernel_is_f16 and
-        engine.ssm_conv1d_qwen_d4_pipe.handle != null;
+        engine.ssm_conv1d_qwen_d4_pipe.handle != null)
+    {
+        return &engine.ssm_conv1d_qwen_d4_pipe;
+    }
+    if (defaultQwen35Dense27bSsmDeltaGatedNormEnabled(engine.config) and
+        conv_channels == 10240 and
+        engine.ssm_conv1d_qwen27b_d4_pipe.handle != null)
+    {
+        return &engine.ssm_conv1d_qwen27b_d4_pipe;
+    }
+    return null;
 }
 
 fn qwenSsmConvD4PrefillPipe(
@@ -843,7 +861,7 @@ fn ssmConv1dThreadgroupSize(
     d_conv: u32,
     kernel_is_f16: bool,
 ) u32 {
-    if (conv_channels == 8192 and
+    if ((conv_channels == 8192 or conv_channels == 10240) and
         d_conv == 4 and
         !kernel_is_f16 and
         pipe.thread_execution_width == 32 and
@@ -4732,6 +4750,7 @@ pub const InferenceEngine = struct {
     // SSM GPU pipelines (cross-compiled from GLSL via SPIRV-Cross)
     ssm_conv1d_pipe: MetalPipeline,
     ssm_conv1d_qwen_d4_pipe: MetalPipeline,
+    ssm_conv1d_qwen27b_d4_pipe: MetalPipeline,
     ssm_conv1d_prefill_pipe: MetalPipeline,
     ssm_conv1d_prefill_qwen_d4_pipe: MetalPipeline,
     ssm_delta_net_pipe: MetalPipeline,
@@ -5598,6 +5617,7 @@ pub const InferenceEngine = struct {
         // SSM GPU pipelines
         self.ssm_conv1d_pipe = try loadShaderPipeline(ctx, "ssm_conv1d");
         self.ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
+        self.ssm_conv1d_qwen27b_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen27b_d4");
         self.ssm_conv1d_prefill_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill");
         self.ssm_conv1d_prefill_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
         self.ssm_delta_net_pipe = try loadShaderPipeline(ctx, "ssm_delta_net");
@@ -6437,6 +6457,7 @@ pub const InferenceEngine = struct {
 
         metal_pipeline.freePipeline(&self.ssm_conv1d_pipe);
         metal_pipeline.freePipeline(&self.ssm_conv1d_qwen_d4_pipe);
+        metal_pipeline.freePipeline(&self.ssm_conv1d_qwen27b_d4_pipe);
         metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_pipe);
         metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_qwen_d4_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_pipe);
@@ -22729,10 +22750,7 @@ fn runDecodeStep(
                         engine.position * conv_channels
                     else
                         0;
-                    const conv_pipe = if (canUseQwenSsmConvD4FastPath(engine, conv_channels, d_conv, false))
-                        &engine.ssm_conv1d_qwen_d4_pipe
-                    else
-                        &engine.ssm_conv1d_pipe;
+                    const conv_pipe = qwenSsmConvD4DecodePipe(engine, conv_channels, d_conv, false) orelse &engine.ssm_conv1d_pipe;
                     dispatchSsmConv1dOffsetWithPipe(
                         cmd,
                         conv_pipe,
@@ -26779,6 +26797,82 @@ test "ssm_conv1d shader matches CPU reference" {
         kernel_ptr[0..kernel_len],
         ref_state[0..state_len],
         ref_output[0..conv_channels],
+        conv_channels,
+        d_conv,
+    );
+
+    var cmd = try metal_command.beginCommand(ctx);
+    dispatchSsmConv1dWithPipe(
+        &cmd,
+        &pipe,
+        &kernel_buf,
+        &state_buf,
+        &input_buf,
+        &output_buf,
+        @intCast(conv_channels),
+        @intCast(d_conv),
+        false,
+    );
+    cmd.commitAndWait();
+
+    for (0..conv_channels) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.0005);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.0005);
+    }
+}
+
+test "qwen27b ssm_conv1d d4 shader matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen27b_d4");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const conv_channels: usize = 10240;
+    const d_conv: usize = 4;
+    const state_len: usize = (d_conv - 1) * conv_channels;
+    const kernel_len: usize = conv_channels * d_conv;
+
+    var kernel_buf = try metal_buffer.createBuffer(ctx, kernel_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&kernel_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, conv_channels * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, conv_channels * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const kernel_ptr: [*]f32 = @ptrCast(@alignCast(kernel_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    for (0..kernel_len) |i| {
+        kernel_ptr[i] = (@as(f32, @floatFromInt(i % 19)) - 9.0) * 0.02173913;
+    }
+    for (0..state_len) |i| {
+        state_ptr[i] = (@as(f32, @floatFromInt(i % 31)) - 15.0) * 0.0125;
+    }
+    for (0..conv_channels) |i| {
+        input_ptr[i] = (@as(f32, @floatFromInt(i % 37)) - 18.0) * 0.017857144;
+    }
+    @memset(output_ptr[0..conv_channels], 0);
+
+    const allocator = std.testing.allocator;
+    const ref_state = try allocator.alloc(f32, state_len);
+    defer allocator.free(ref_state);
+    const ref_output = try allocator.alloc(f32, conv_channels);
+    defer allocator.free(ref_output);
+    @memcpy(ref_state, state_ptr[0..state_len]);
+    @memset(ref_output, 0);
+    refRunSsmConv1d(
+        input_ptr[0..conv_channels],
+        kernel_ptr[0..kernel_len],
+        ref_state,
+        ref_output,
         conv_channels,
         d_conv,
     );
@@ -30852,6 +30946,8 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&ssm_delta_net_gated_norm_qwen_pipe);
     var ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
     defer metal_pipeline.freePipeline(&ssm_conv1d_qwen_d4_pipe);
+    var ssm_conv1d_qwen27b_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen27b_d4");
+    defer metal_pipeline.freePipeline(&ssm_conv1d_qwen27b_d4_pipe);
     var ssm_conv1d_prefill_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
     defer metal_pipeline.freePipeline(&ssm_conv1d_prefill_qwen_d4_pipe);
 
@@ -30957,6 +31053,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(ssm_delta_net_gated_norm_pipe.handle != null);
     try std.testing.expect(ssm_delta_net_gated_norm_qwen_pipe.handle != null);
     try std.testing.expect(ssm_conv1d_qwen_d4_pipe.handle != null);
+    try std.testing.expect(ssm_conv1d_qwen27b_d4_pipe.handle != null);
     try std.testing.expect(ssm_conv1d_prefill_qwen_d4_pipe.handle != null);
 }
 
