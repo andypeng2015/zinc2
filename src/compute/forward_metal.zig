@@ -703,8 +703,24 @@ fn qwen35DenseQ4KSwiGLUValidationRequested(cfg: ModelConfig) bool {
     if (!defaultQwen35Dense27bSsmDeltaGatedNormEnabled(cfg)) return false;
     return (readBoolEnv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE") orelse false) or
         (readBoolEnv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE") orelse false) or
+        qwen35DenseQ4KSwiGLUValidationScanRequested() or
         std.posix.getenv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_LAYER") != null or
-        std.posix.getenv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_LAYER") != null;
+        std.posix.getenv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_LAYER") != null or
+        std.posix.getenv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN") != null or
+        std.posix.getenv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_TOKEN") != null;
+}
+
+fn qwen35DenseQ4KSwiGLUValidationScanRequested() bool {
+    return (readBoolEnv("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_SCAN") orelse false) or
+        (readBoolEnv("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_SCAN") orelse false);
+}
+
+fn qwen35DenseQ4KSwiGLUValidateTokens() u32 {
+    const requested =
+        readU32Env("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKENS") orelse
+        readU32Env("ZINC_METAL_QWEN36_27B_Q4K_SWIGLU_VALIDATE_TOKENS") orelse
+        1;
+    return @min(@max(requested, 1), 8);
 }
 
 fn qwen35DenseQ4KSwiGLUValidateLayer(engine: *const InferenceEngine) usize {
@@ -5778,7 +5794,13 @@ pub const InferenceEngine = struct {
     dense_gemma_q4k_geglu_validation_scanned_tokens: u32,
     dense_gemma_q4k_geglu_validation_token_limit: u32,
     qwen35_dense_q4k_swiglu_validation_enabled: bool,
+    qwen35_dense_q4k_swiglu_validation_scan_layers: bool,
     qwen35_dense_q4k_swiglu_validation_emitted: bool,
+    qwen35_dense_q4k_swiglu_validation_scanned_tokens: u32,
+    qwen35_dense_q4k_swiglu_validation_token_limit: u32,
+    qwen35_dense_q4k_swiglu_validation_prompt_tokens: u32,
+    qwen35_dense_q4k_swiglu_validation_ok_mask: u64,
+    qwen35_dense_q4k_swiglu_validation_fail_mask: u64,
     request_profile: RuntimeProfile,
     prefill_profile: RuntimeProfile,
     lm_head_argmax_cpu_reduce_pairs: u32,
@@ -5959,9 +5981,19 @@ pub const InferenceEngine = struct {
             log.info("Metal profile: dense Gemma31 Q4_K GeGLU validator layer-mask scan enabled at layer {d}; set ZINC_METAL_GEMMA_Q4K_GEGLU_PROFILE_SCAN=0 to skip or ZINC_METAL_GEMMA_Q4K_GEGLU_VALIDATE_SCAN=1 for first-failure scan", .{denseGemmaQ4KGeGLUValidateLayer(&self)});
         }
         self.qwen35_dense_q4k_swiglu_validation_enabled = qwen35DenseQ4KSwiGLUValidationRequested(cfg);
+        self.qwen35_dense_q4k_swiglu_validation_scan_layers = qwen35DenseQ4KSwiGLUValidationScanRequested();
         self.qwen35_dense_q4k_swiglu_validation_emitted = false;
+        self.qwen35_dense_q4k_swiglu_validation_scanned_tokens = 0;
+        self.qwen35_dense_q4k_swiglu_validation_token_limit = qwen35DenseQ4KSwiGLUValidateTokens();
+        self.qwen35_dense_q4k_swiglu_validation_prompt_tokens = 0;
+        self.qwen35_dense_q4k_swiglu_validation_ok_mask = 0;
+        self.qwen35_dense_q4k_swiglu_validation_fail_mask = 0;
         if (self.qwen35_dense_q4k_swiglu_validation_enabled) {
-            log.info("Metal validation: Qwen3.6 27B dense Q4_K gate/up+SwiGLU validator enabled at layer {d}; optional token filter ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN", .{qwen35DenseQ4KSwiGLUValidateLayer(&self)});
+            log.info("Metal validation: Qwen3.6 27B dense Q4_K gate/up+SwiGLU validator enabled at layer {d} scan={s} tokens={d}; optional token filter ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_TOKEN", .{
+                qwen35DenseQ4KSwiGLUValidateLayer(&self),
+                if (self.qwen35_dense_q4k_swiglu_validation_scan_layers) "yes" else "no",
+                self.qwen35_dense_q4k_swiglu_validation_token_limit,
+            });
         }
         self.in_prefill_phase = false;
         self.dense_gemma_wide_post_norm_prefill_enabled =
@@ -7580,6 +7612,10 @@ pub const InferenceEngine = struct {
         self.dense_gemma_q4k_geglu_validation_emitted = false;
         self.dense_gemma_q4k_geglu_validation_scanned_tokens = 0;
         self.qwen35_dense_q4k_swiglu_validation_emitted = false;
+        self.qwen35_dense_q4k_swiglu_validation_scanned_tokens = 0;
+        self.qwen35_dense_q4k_swiglu_validation_prompt_tokens = 0;
+        self.qwen35_dense_q4k_swiglu_validation_ok_mask = 0;
+        self.qwen35_dense_q4k_swiglu_validation_fail_mask = 0;
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -11270,7 +11306,11 @@ fn shouldValidateQwen35DenseQ4KGateUpSwiGLU(
     if (engine.in_prefill_phase) return false;
     if (engine.private_decode_buffers) return false;
     if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
-    if (layer_idx != qwen35DenseQ4KSwiGLUValidateLayer(engine)) return false;
+    const requested_layer = qwen35DenseQ4KSwiGLUValidateLayer(engine);
+    if (engine.qwen35_dense_q4k_swiglu_validation_scan_layers) {
+        if (layer_idx < requested_layer) return false;
+        if (engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens >= engine.qwen35_dense_q4k_swiglu_validation_token_limit) return false;
+    } else if (layer_idx != requested_layer) return false;
     if (qwen35DenseQ4KSwiGLUValidateToken()) |token| {
         if (engine.position != token) return false;
     }
@@ -11279,6 +11319,11 @@ fn shouldValidateQwen35DenseQ4KGateUpSwiGLU(
         engine.dmmv_q4k_dense_gate_up_swiglu_pipe.max_threads_per_threadgroup >= 64 and
         engine.swiglu_buf.cpu_ptr != null and
         engine.down_buf.cpu_ptr != null;
+}
+
+fn qwen35DenseQ4KSwiGLULayerMaskBit(layer_idx: usize) u64 {
+    if (layer_idx >= 64) return 0;
+    return @as(u64, 1) << @as(u6, @intCast(layer_idx));
 }
 
 fn dispatchDenseQ4KGateUpSwiGLUOnCmd(
@@ -11365,10 +11410,39 @@ fn validateQwen35DenseQ4KGateUpSwiGLUOnCmd(
     const candidate_value = if (M > 0) candidate_slice[diff.max_idx] else 0.0;
     const tol: f32 = 5e-2;
     const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
+    const scan_layers = engine.qwen35_dense_q4k_swiglu_validation_scan_layers;
+    const requested_layer = qwen35DenseQ4KSwiGLUValidateLayer(engine);
+    const scan_token = engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens + 1;
+    if (scan_layers and layer_idx == requested_layer) {
+        engine.qwen35_dense_q4k_swiglu_validation_ok_mask = 0;
+        engine.qwen35_dense_q4k_swiglu_validation_fail_mask = 0;
+        if (engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens == 0) {
+            engine.qwen35_dense_q4k_swiglu_validation_prompt_tokens = engine.position;
+        }
+    } else if (!scan_layers) {
+        engine.qwen35_dense_q4k_swiglu_validation_prompt_tokens = engine.position;
+    }
+    const prompt_tokens = if (engine.qwen35_dense_q4k_swiglu_validation_prompt_tokens != 0)
+        engine.qwen35_dense_q4k_swiglu_validation_prompt_tokens
+    else
+        engine.position;
+
+    const layer_bit = qwen35DenseQ4KSwiGLULayerMaskBit(layer_idx);
+    if (scan_layers and layer_bit != 0) {
+        if (diff.max_abs <= tol) {
+            engine.qwen35_dense_q4k_swiglu_validation_ok_mask |= layer_bit;
+        } else {
+            engine.qwen35_dense_q4k_swiglu_validation_fail_mask |= layer_bit;
+        }
+    }
+
     if (diff.max_abs <= tol) {
-        log.info("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE[{s}]: token={d} layer={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} flag_on=ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE=1", .{
+        log.info("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE[{s}]: prompt_tokens={d} token={d} scan_token={d}/{d} layer={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} flag_on=ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_SCAN=1", .{
             verdict,
+            prompt_tokens,
             engine.position,
+            scan_token,
+            engine.qwen35_dense_q4k_swiglu_validation_token_limit,
             layer_idx,
             diff.max_abs,
             diff.max_idx,
@@ -11378,9 +11452,12 @@ fn validateQwen35DenseQ4KGateUpSwiGLUOnCmd(
             tol,
         });
     } else {
-        log.warn("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE[{s}]: token={d} layer={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} flag_on=ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE=1", .{
+        log.warn("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE[{s}]: prompt_tokens={d} token={d} scan_token={d}/{d} layer={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} flag_on=ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_SCAN=1", .{
             verdict,
+            prompt_tokens,
             engine.position,
+            scan_token,
+            engine.qwen35_dense_q4k_swiglu_validation_token_limit,
             layer_idx,
             diff.max_abs,
             diff.max_idx,
@@ -11390,7 +11467,31 @@ fn validateQwen35DenseQ4KGateUpSwiGLUOnCmd(
             tol,
         });
     }
-    engine.qwen35_dense_q4k_swiglu_validation_emitted = true;
+    if (scan_layers) {
+        const last_layer_idx = if (engine.config.n_layers == 0)
+            0
+        else
+            @as(usize, @intCast(engine.config.n_layers - 1));
+        if (layer_idx >= last_layer_idx) {
+            engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens += 1;
+            log.info("ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_SCAN_SUMMARY: prompt_tokens={d} token={d} scan_token={d}/{d} start_layer={d} ok_mask=0x{x} fail_mask=0x{x} flag_on=ZINC_METAL_QWEN27B_Q4K_SWIGLU_VALIDATE_SCAN=1", .{
+                prompt_tokens,
+                engine.position,
+                engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens,
+                engine.qwen35_dense_q4k_swiglu_validation_token_limit,
+                requested_layer,
+                engine.qwen35_dense_q4k_swiglu_validation_ok_mask,
+                engine.qwen35_dense_q4k_swiglu_validation_fail_mask,
+            });
+            if (engine.qwen35_dense_q4k_swiglu_validation_scanned_tokens >= engine.qwen35_dense_q4k_swiglu_validation_token_limit or
+                qwen35DenseQ4KSwiGLUValidateToken() != null)
+            {
+                engine.qwen35_dense_q4k_swiglu_validation_emitted = true;
+            }
+        }
+    } else {
+        engine.qwen35_dense_q4k_swiglu_validation_emitted = true;
+    }
     cmd.* = try beginProfiledCommand(engine, profile);
 }
 
