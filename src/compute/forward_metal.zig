@@ -21756,12 +21756,12 @@ fn waitPendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*Runt
     // llama.cpp's graph submission pattern, wait on the last dense chunk to
     // synchronize the token, then release the already-completed earlier chunks.
     waitCommandProfiled(&cmds[n - 1], profile);
-    releaseCommands(cmds[0 .. n - 1]);
+    releaseCompletedCommands(cmds[0 .. n - 1]);
     count.* = 0;
 }
 
 fn releasePendingDenseCommands(cmds: []MetalCommand, count: *usize) void {
-    releaseCommands(cmds[0..count.*]);
+    releaseCompletedCommands(cmds[0..count.*]);
     count.* = 0;
 }
 
