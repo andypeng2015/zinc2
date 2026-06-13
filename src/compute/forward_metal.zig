@@ -4644,6 +4644,7 @@ pub const InferenceEngine = struct {
     dmmv_q5k_native_pipe: MetalPipeline,
     dmmv_q6k_pipe: MetalPipeline,
     dmmv_q6k_llama_pipe: MetalPipeline,
+    dmmv_q6k_llama_k5120_pipe: MetalPipeline,
     dmmv_q6k_llama_k17408_pipe: MetalPipeline,
     dmmv_q8_0_pipe: MetalPipeline,
     dmmv_q5_0_pipe: MetalPipeline,
@@ -5373,6 +5374,12 @@ pub const InferenceEngine = struct {
         self.dmmv_q5k_native_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_native");
         self.dmmv_q6k_pipe = try loadShaderPipeline(ctx, "dmmv_q6k");
         self.dmmv_q6k_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_llama");
+        self.dmmv_q6k_llama_k5120_pipe = try loadShaderPipelineWithPrefix(
+            ctx,
+            "dmmv_q6k_llama_k5120",
+            "dmmv_q6k_llama",
+            "#define ZINC_Q6K_FIXED_BLOCKS 20\n#define ZINC_Q6K_NSG 4\n",
+        );
         self.dmmv_q6k_llama_k17408_pipe = try loadShaderPipelineWithPrefix(
             ctx,
             "dmmv_q6k_llama_k17408",
@@ -6345,6 +6352,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q5k_native_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_llama_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q6k_llama_k5120_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_llama_k17408_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_0_pipe);
@@ -8608,12 +8616,19 @@ pub const InferenceEngine = struct {
                 // K%256==0 (Gemma final norm, Qwen3 lm_head) the llama variant
                 // is strictly better.
                 if (canUseDenseQ6kSimdgroupDmmvShape(self.config, tensor.info.name, M, K) and
-                    (self.dmmv_q6k_llama_pipe.handle != null or self.dmmv_q6k_llama_k17408_pipe.handle != null))
+                    (self.dmmv_q6k_llama_pipe.handle != null or
+                        self.dmmv_q6k_llama_k5120_pipe.handle != null or
+                        self.dmmv_q6k_llama_k17408_pipe.handle != null))
                 {
                     if (isQwen35DenseDownQ6kTarget(self.config, tensor.info.name, M, K) and
                         self.dmmv_q6k_llama_k17408_pipe.handle != null)
                     {
                         break :blk .{ .pipe = &self.dmmv_q6k_llama_k17408_pipe, .push_idx = 1, .rows_per_wg = 8, .block_size = 128 };
+                    }
+                    if (isQwen35LmHeadQ6kTarget(self.config, tensor.info.name, M, K) and
+                        self.dmmv_q6k_llama_k5120_pipe.handle != null)
+                    {
+                        break :blk .{ .pipe = &self.dmmv_q6k_llama_k5120_pipe, .push_idx = 1, .rows_per_wg = 8, .block_size = 128 };
                     }
                     if (self.dmmv_q6k_llama_pipe.handle != null) {
                         break :blk .{ .pipe = &self.dmmv_q6k_llama_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
@@ -11860,7 +11875,9 @@ fn canUseDenseQ6kSimdgroupDmmv(
     // that does not match this N=1 dense projection shape.
     return canUseDenseQ6kSimdgroupDmmvShape(engine.config, tensor.info.name, M, K) and
         tensor.info.type_ == .q6_k and
-        (engine.dmmv_q6k_llama_pipe.handle != null or engine.dmmv_q6k_llama_k17408_pipe.handle != null);
+        (engine.dmmv_q6k_llama_pipe.handle != null or
+            engine.dmmv_q6k_llama_k5120_pipe.handle != null or
+            engine.dmmv_q6k_llama_k17408_pipe.handle != null);
 }
 
 fn dispatchDenseQ6kSimdgroupDmmvOnCmd(
@@ -11877,6 +11894,9 @@ fn dispatchDenseQ6kSimdgroupDmmvOnCmd(
     const pipe: ?*MetalPipeline = if (isQwen35DenseDownQ6kTarget(engine.config, tensor.info.name, M, K) and
         engine.dmmv_q6k_llama_k17408_pipe.handle != null)
         &engine.dmmv_q6k_llama_k17408_pipe
+    else if (isQwen35LmHeadQ6kTarget(engine.config, tensor.info.name, M, K) and
+        engine.dmmv_q6k_llama_k5120_pipe.handle != null)
+        &engine.dmmv_q6k_llama_k5120_pipe
     else if (engine.dmmv_q6k_llama_pipe.handle != null)
         &engine.dmmv_q6k_llama_pipe
     else
@@ -11894,12 +11914,16 @@ fn dispatchDenseQ6kSimdgroupDmmvOnCmd(
         const uses_dense_down_nsg4 =
             selected_pipe == &engine.dmmv_q6k_llama_k17408_pipe and
             isQwen35DenseDownQ6kTarget(engine.config, tensor.info.name, M, K);
-        const rows_per_wg: u32 = if (uses_dense_down_nsg4) 8 else 4;
+        const uses_lm_head_nsg4 =
+            selected_pipe == &engine.dmmv_q6k_llama_k5120_pipe and
+            isQwen35LmHeadQ6kTarget(engine.config, tensor.info.name, M, K);
+        const uses_nsg4 = uses_dense_down_nsg4 or uses_lm_head_nsg4;
+        const rows_per_wg: u32 = if (uses_nsg4) 8 else 4;
         const wgs = (M + rows_per_wg - 1) / rows_per_wg;
         var timing_label_buf: [192]u8 = undefined;
         const has_timing_label = setDmmvTimingLabel(cmd, engine, tensor, M, K, selected_pipe, &timing_label_buf);
         defer if (has_timing_label) cmd.clearTimingLabel();
-        const block_size: u32 = if (uses_dense_down_nsg4) 128 else 64;
+        const block_size: u32 = if (uses_nsg4) 128 else 64;
         cmd.dispatchV2(selected_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 1);
         return;
     }
@@ -30973,6 +30997,13 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&dmmv_q6k_moe_pipe);
     var dmmv_q6k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe_cols");
     defer metal_pipeline.freePipeline(&dmmv_q6k_moe_cols_pipe);
+    var dmmv_q6k_llama_k5120_pipe = try loadShaderPipelineWithPrefix(
+        ctx,
+        "dmmv_q6k_llama_k5120",
+        "dmmv_q6k_llama",
+        "#define ZINC_Q6K_FIXED_BLOCKS 20\n#define ZINC_Q6K_NSG 4\n",
+    );
+    defer metal_pipeline.freePipeline(&dmmv_q6k_llama_k5120_pipe);
     var dmmv_q6k_llama_k17408_pipe = try loadShaderPipelineWithPrefix(
         ctx,
         "dmmv_q6k_llama_k17408",
@@ -31160,6 +31191,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q5k_moe_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_moe_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_moe_cols_pipe.handle != null);
+    try std.testing.expect(dmmv_q6k_llama_k5120_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_llama_k17408_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_k17408_pipe.handle != null);
     try std.testing.expect(gemm_q5k_pipe.handle != null);
