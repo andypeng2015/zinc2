@@ -1323,6 +1323,9 @@ pub const RuntimeProfile = struct {
     decode_async_slot_ssm_projection_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_ssm_out_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_dense_ffn_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_dense_gate_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_dense_up_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
+    decode_async_slot_dense_down_bytes: [decode_async_profile_slots]u64 = [_]u64{0} ** decode_async_profile_slots,
     decode_async_slot_ssm_barrier_phases: [decode_async_profile_slots]SsmBarrierPhaseCounters = [_]SsmBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
     decode_async_slot_dense_barrier_phases: [decode_async_profile_slots]DenseFfnBarrierPhaseCounters = [_]DenseFfnBarrierPhaseCounters{.{}} ** decode_async_profile_slots,
     sample_ns: u64 = 0,
@@ -2092,6 +2095,9 @@ fn profileDeltaForSplit(total: RuntimeProfile, prefix: RuntimeProfile) RuntimePr
         delta.decode_async_slot_ssm_projection_bytes[idx] = total.decode_async_slot_ssm_projection_bytes[idx] -| prefix.decode_async_slot_ssm_projection_bytes[idx];
         delta.decode_async_slot_ssm_out_bytes[idx] = total.decode_async_slot_ssm_out_bytes[idx] -| prefix.decode_async_slot_ssm_out_bytes[idx];
         delta.decode_async_slot_dense_ffn_bytes[idx] = total.decode_async_slot_dense_ffn_bytes[idx] -| prefix.decode_async_slot_dense_ffn_bytes[idx];
+        delta.decode_async_slot_dense_gate_bytes[idx] = total.decode_async_slot_dense_gate_bytes[idx] -| prefix.decode_async_slot_dense_gate_bytes[idx];
+        delta.decode_async_slot_dense_up_bytes[idx] = total.decode_async_slot_dense_up_bytes[idx] -| prefix.decode_async_slot_dense_up_bytes[idx];
+        delta.decode_async_slot_dense_down_bytes[idx] = total.decode_async_slot_dense_down_bytes[idx] -| prefix.decode_async_slot_dense_down_bytes[idx];
         delta.decode_async_slot_ssm_barrier_phases[idx] = SsmBarrierPhaseCounters.diff(total.decode_async_slot_ssm_barrier_phases[idx], prefix.decode_async_slot_ssm_barrier_phases[idx]);
         delta.decode_async_slot_dense_barrier_phases[idx] = DenseFfnBarrierPhaseCounters.diff(total.decode_async_slot_dense_barrier_phases[idx], prefix.decode_async_slot_dense_barrier_phases[idx]);
     }
@@ -2507,6 +2513,7 @@ fn logDenseFfnBarrierKindBreakdown(label: []const u8, profile: RuntimeProfile) v
 
 fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void {
     var emitted_header = false;
+    var emitted_dense_header = false;
     var emitted_phase_header = false;
     var slowest_slot: ?usize = null;
     var slowest_gpu_ms: f64 = 0.0;
@@ -2542,6 +2549,22 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
             avgGiB(profile.decode_async_slot_ssm_out_bytes[slot], layer_submits),
             avgGiB(profile.decode_async_slot_dense_ffn_bytes[slot], layer_submits),
         });
+        if (profile.decode_async_slot_dense_ffn_bytes[slot] > 0) {
+            if (!emitted_dense_header) {
+                log.info("  {s} async decode chunk slot dense byte order: gate/up/down", .{label});
+                emitted_dense_header = true;
+            }
+            log.info("  {s} async decode chunk slot {d} dense bytes avg: {d:.2}/{d:.2}/{d:.2} GiB pct {d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                slot,
+                avgGiB(profile.decode_async_slot_dense_gate_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_dense_up_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_dense_down_bytes[slot], layer_submits),
+                pctOf(profile.decode_async_slot_dense_ffn_bytes[slot], profile.decode_async_slot_dense_gate_bytes[slot]),
+                pctOf(profile.decode_async_slot_dense_ffn_bytes[slot], profile.decode_async_slot_dense_up_bytes[slot]),
+                pctOf(profile.decode_async_slot_dense_ffn_bytes[slot], profile.decode_async_slot_dense_down_bytes[slot]),
+            });
+        }
         const ssm_barriers = profile.decode_async_slot_ssm_barrier_phases[slot];
         const dense_barriers = profile.decode_async_slot_dense_barrier_phases[slot];
         if (ssm_barriers.total() > 0 or dense_barriers.total() > 0) {
@@ -2589,6 +2612,17 @@ fn logDecodeAsyncSlotBreakdown(label: []const u8, profile: RuntimeProfile) void 
             avgCount(profile.decode_async_slot_dispatch_calls[slot], submits),
             avgCount(profile.decode_async_slot_barrier_calls[slot], submits),
         });
+        if (profile.decode_async_slot_dense_ffn_bytes[slot] > 0) {
+            log.info("  {s} async decode chunk bottleneck dense split: gate/up/down {d:.2}/{d:.2}/{d:.2} GiB pct_total {d:.1}/{d:.1}/{d:.1}", .{
+                label,
+                avgGiB(profile.decode_async_slot_dense_gate_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_dense_up_bytes[slot], layer_submits),
+                avgGiB(profile.decode_async_slot_dense_down_bytes[slot], layer_submits),
+                pctOf(total_bytes, profile.decode_async_slot_dense_gate_bytes[slot]),
+                pctOf(total_bytes, profile.decode_async_slot_dense_up_bytes[slot]),
+                pctOf(total_bytes, profile.decode_async_slot_dense_down_bytes[slot]),
+            });
+        }
     }
 }
 
@@ -22704,10 +22738,13 @@ fn recordDecodeAsyncSlotLayerBytes(
         }
 
         if (cfg.n_experts == 0) {
-            profile.decode_async_slot_dense_ffn_bytes[slot] +=
-                tensorDmmvBytesForCols(lt.ffn_gate, hidden_dim) +
-                tensorDmmvBytesForCols(lt.ffn_up, hidden_dim) +
-                tensorDmmvBytesForCols(lt.ffn_down, inter_dim);
+            const gate_bytes = tensorDmmvBytesForCols(lt.ffn_gate, hidden_dim);
+            const up_bytes = tensorDmmvBytesForCols(lt.ffn_up, hidden_dim);
+            const down_bytes = tensorDmmvBytesForCols(lt.ffn_down, inter_dim);
+            profile.decode_async_slot_dense_gate_bytes[slot] += gate_bytes;
+            profile.decode_async_slot_dense_up_bytes[slot] += up_bytes;
+            profile.decode_async_slot_dense_down_bytes[slot] += down_bytes;
+            profile.decode_async_slot_dense_ffn_bytes[slot] += gate_bytes + up_bytes + down_bytes;
         }
     }
 }
@@ -31220,6 +31257,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     prefix.decode_async_slot_ssm_projection_bytes[0] = 300;
     prefix.decode_async_slot_ssm_out_bytes[0] = 400;
     prefix.decode_async_slot_dense_ffn_bytes[0] = 500;
+    prefix.decode_async_slot_dense_gate_bytes[0] = 100;
+    prefix.decode_async_slot_dense_up_bytes[0] = 150;
+    prefix.decode_async_slot_dense_down_bytes[0] = 250;
     prefix.decode_async_slot_submits[1] = 3;
     prefix.decode_async_slot_dispatch_calls[1] = 33;
     prefix.decode_async_slot_barrier_calls[1] = 30;
@@ -31236,6 +31276,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     prefix.decode_async_slot_ssm_projection_bytes[1] = 700;
     prefix.decode_async_slot_ssm_out_bytes[1] = 800;
     prefix.decode_async_slot_dense_ffn_bytes[1] = 900;
+    prefix.decode_async_slot_dense_gate_bytes[1] = 200;
+    prefix.decode_async_slot_dense_up_bytes[1] = 300;
+    prefix.decode_async_slot_dense_down_bytes[1] = 400;
 
     var total = RuntimeProfile{
         .decode_async_submitted_dispatch_calls = 900,
@@ -31291,6 +31334,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     total.decode_async_slot_ssm_projection_bytes[0] = 3_000;
     total.decode_async_slot_ssm_out_bytes[0] = 4_000;
     total.decode_async_slot_dense_ffn_bytes[0] = 5_000;
+    total.decode_async_slot_dense_gate_bytes[0] = 1_000;
+    total.decode_async_slot_dense_up_bytes[0] = 1_500;
+    total.decode_async_slot_dense_down_bytes[0] = 2_500;
     total.decode_async_slot_submits[1] = 11;
     total.decode_async_slot_dispatch_calls[1] = 121;
     total.decode_async_slot_barrier_calls[1] = 110;
@@ -31307,6 +31353,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     total.decode_async_slot_ssm_projection_bytes[1] = 7_000;
     total.decode_async_slot_ssm_out_bytes[1] = 8_000;
     total.decode_async_slot_dense_ffn_bytes[1] = 9_000;
+    total.decode_async_slot_dense_gate_bytes[1] = 2_000;
+    total.decode_async_slot_dense_up_bytes[1] = 3_000;
+    total.decode_async_slot_dense_down_bytes[1] = 4_000;
 
     const delta = profileDeltaForSplit(total, prefix);
     try std.testing.expectEqual(@as(u32, 810), delta.decode_async_submitted_dispatch_calls);
@@ -31331,6 +31380,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     try std.testing.expectEqual(@as(u64, 2_700), delta.decode_async_slot_ssm_projection_bytes[0]);
     try std.testing.expectEqual(@as(u64, 3_600), delta.decode_async_slot_ssm_out_bytes[0]);
     try std.testing.expectEqual(@as(u64, 4_500), delta.decode_async_slot_dense_ffn_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 900), delta.decode_async_slot_dense_gate_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 1_350), delta.decode_async_slot_dense_up_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 2_250), delta.decode_async_slot_dense_down_bytes[0]);
     try std.testing.expectEqual(@as(u32, 8), delta.decode_async_slot_submits[1]);
     try std.testing.expectEqual(@as(u32, 88), delta.decode_async_slot_dispatch_calls[1]);
     try std.testing.expectEqual(@as(u32, 80), delta.decode_async_slot_barrier_calls[1]);
@@ -31347,6 +31399,9 @@ test "profile split preserves SSM and dense tail phase counters" {
     try std.testing.expectEqual(@as(u64, 6_300), delta.decode_async_slot_ssm_projection_bytes[1]);
     try std.testing.expectEqual(@as(u64, 7_200), delta.decode_async_slot_ssm_out_bytes[1]);
     try std.testing.expectEqual(@as(u64, 8_100), delta.decode_async_slot_dense_ffn_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 1_800), delta.decode_async_slot_dense_gate_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 2_700), delta.decode_async_slot_dense_up_bytes[1]);
+    try std.testing.expectEqual(@as(u64, 3_600), delta.decode_async_slot_dense_down_bytes[1]);
     try std.testing.expectEqual(@as(u32, 30), delta.ssm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 10), delta.ssm_proj_norm_barrier_calls);
     try std.testing.expectEqual(@as(u32, 20), delta.ssm_qkv_barrier_calls);
