@@ -13669,7 +13669,19 @@ fn dispatchFfnActivationOnCmd(
     const push = SwiGLUPush{ .n = n };
     const bufs = [_]*const MetalBuffer{ gate, output, up };
     const pipe = if (usesGeglu(engine.config)) &engine.geglu_pipe else &engine.swiglu_pipe;
-    cmd.dispatchV2(pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+    const tg_size = ffnActivationThreadgroupSize(engine, n);
+    cmd.dispatchV2(pipe, .{ (n + tg_size - 1) / tg_size, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+}
+
+fn ffnActivationThreadgroupSize(engine: *const InferenceEngine, n: u32) u32 {
+    if (!usesGeglu(engine.config) and
+        defaultQwen35Dense27bSsmDeltaGatedNormEnabled(engine.config) and
+        n == engine.config.intermediate_dim and
+        engine.swiglu_pipe.max_threads_per_threadgroup >= 256)
+    {
+        return 256;
+    }
+    return 64;
 }
 
 fn dispatchGeGLUFastUncheckedOnCmd(
