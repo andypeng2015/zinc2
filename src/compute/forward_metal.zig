@@ -4630,6 +4630,7 @@ pub const InferenceEngine = struct {
     dmmv_q4k_pipe: MetalPipeline,
     dmmv_q4k_k2048_pipe: MetalPipeline,
     dmmv_q4k_k5120_pipe: MetalPipeline,
+    dmmv_q4k_k5120_llama_pipe: MetalPipeline,
     dmmv_q4k_k17408_pipe: MetalPipeline,
     dmmv_q4k_dual_pipe: MetalPipeline,
     dmmv_q4k_dual_llama_pipe: MetalPipeline,
@@ -5354,6 +5355,12 @@ pub const InferenceEngine = struct {
             "dmmv_q4k_k5120",
             "dmmv_q4k",
             "#define ZINC_Q4K_FIXED_BLOCKS 20\n#define ZINC_Q4K_NSG 4\n",
+        );
+        self.dmmv_q4k_k5120_llama_pipe = try loadShaderPipelineWithPrefix(
+            ctx,
+            "dmmv_q4k_k5120_llama",
+            "dmmv_q4k",
+            "#define ZINC_Q4K_FIXED_BLOCKS 20\n",
         );
         self.dmmv_q4k_k17408_pipe = try loadShaderPipelineWithPrefix(
             ctx,
@@ -6338,6 +6345,7 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.dmmv_q4k_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_k5120_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_k5120_llama_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_k17408_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_dual_llama_pipe);
@@ -8561,15 +8569,17 @@ pub const InferenceEngine = struct {
             .q4_k => blk: {
                 const k2048_or_less = K <= 2048;
                 if (isQwen35DenseGateUpQ4kTarget(self.config, tensor.info.name, M, K) and
-                    self.dmmv_q4k_k5120_pipe.handle != null)
+                    self.dmmv_q4k_k5120_llama_pipe.handle != null)
                 {
                     // Qwen3.6 27B dense gate/up is the hottest Q4_K bucket
-                    // (M=17408,K=5120). Keep the same llama-style single
-                    // projection path that stayed correct in cycle 6. Adapt
-                    // llama.cpp's `kernel_mul_mv_q4_K_f32_impl` row grouping
-                    // by keeping NR0=2 per simdgroup while packing four
-                    // simdgroups into each threadgroup for this exact shape.
-                    break :blk .{ .pipe = &self.dmmv_q4k_k5120_pipe, .push_idx = 1, .rows_per_wg = 8, .block_size = 128 };
+                    // (M=17408,K=5120). Cycle 5 showed that grouping gate/up
+                    // projections in one dispatch loses throughput here, so keep
+                    // single-projection math. This variant adapts llama.cpp
+                    // `kernel_mul_mv_q4_K_f32_impl` more literally than the
+                    // retained NSG4 cleanup route: bake K=5120, but preserve the
+                    // 2-simdgroup / 4-row threadgroup shape to reduce per-TG
+                    // register pressure on the huge dense gate/up rows.
+                    break :blk .{ .pipe = &self.dmmv_q4k_k5120_llama_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
                 }
                 if (isQwen35DenseDownQ4kTarget(self.config, tensor.info.name, M, K) and
                     self.dmmv_q4k_k17408_pipe.handle != null)
@@ -31018,6 +31028,13 @@ test "batched MoE Metal shaders compile" {
         "#define ZINC_Q4K_FIXED_BLOCKS 20\n#define ZINC_Q4K_NSG 4\n",
     );
     defer metal_pipeline.freePipeline(&dmmv_q4k_k5120_pipe);
+    var dmmv_q4k_k5120_llama_pipe = try loadShaderPipelineWithPrefix(
+        ctx,
+        "dmmv_q4k_k5120_llama",
+        "dmmv_q4k",
+        "#define ZINC_Q4K_FIXED_BLOCKS 20\n",
+    );
+    defer metal_pipeline.freePipeline(&dmmv_q4k_k5120_llama_pipe);
     var dmmv_q4k_k17408_pipe = try loadShaderPipelineWithPrefix(
         ctx,
         "dmmv_q4k_k17408",
@@ -31193,6 +31210,7 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(dmmv_q6k_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_llama_k5120_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_llama_k17408_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_k5120_llama_pipe.handle != null);
     try std.testing.expect(dmmv_q4k_k17408_pipe.handle != null);
     try std.testing.expect(gemm_q5k_pipe.handle != null);
     try std.testing.expect(dmmv_pipe_k2048.handle != null);
