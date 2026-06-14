@@ -1565,8 +1565,10 @@ const DirectComputeTracking = struct {
 // default without paying for broad layer coverage on every run. Full decode
 // slices are validation-only now that coverage has been proven; they remain
 // opt-in. The default decode proof is one LM-head prefix row-range on the first
-// decode step plus a low-cadence full-router row-range replacement, so token
-// selection and MoE routing both consume GPU-produced DMMV values.
+// decode step plus a low-cadence full-router row-range replacement. That
+// tracked router layer also feeds the MoE Q4_0 prefix replacement path, so token
+// selection, routing, and expert activations consume GPU-produced DMMV values
+// without enabling broad full-slice validation by default.
 // F32 projections validate each row range against the CPU oracle; paired Q8_0
 // projections can use trust-after-success after the first passing pair.
 const direct_decode_model_slice_enabled_default = false;
@@ -1900,9 +1902,9 @@ fn generateScalarHybrid(
         log.info("M1 AMDGPU CS direct LM-head prefix row cap: {d} rows", .{directLmHeadQ4_0ArgmaxPrefixRowsLimit()});
         if (direct_router_decode_enabled) {
             if (direct_router_decode_cadence == 0) {
-                log.info("M1 AMDGPU CS direct router execution enabled: one full router row-range consumed per decode token", .{});
+                log.info("M1 AMDGPU CS direct router/MoE execution enabled: one full router row-range plus MoE prefix slices consumed per decode token", .{});
             } else {
-                log.info("M1 AMDGPU CS direct router execution enabled: one full router row-range consumed every {d} decode tokens", .{direct_router_decode_cadence});
+                log.info("M1 AMDGPU CS direct router/MoE execution enabled: one full router row-range plus MoE prefix slices consumed every {d} decode tokens", .{direct_router_decode_cadence});
             }
         } else {
             log.info("M1 AMDGPU CS direct router execution disabled by ZINC_RT_DIRECT_ROUTER_DECODE=0", .{});
@@ -5572,6 +5574,7 @@ fn runMoeLayer(
         return;
     }
 
+    const expert_direct_tracking = direct_compute_tracking orelse direct_router_tracking;
     const ran_parallel = runMoeExpertsParallel(
         state,
         cfg,
@@ -5586,7 +5589,7 @@ fn runMoeLayer(
         down_type,
         effective_down_stride,
         shared_params,
-        direct_compute_tracking,
+        expert_direct_tracking,
     );
 
     if (ran_parallel) {
