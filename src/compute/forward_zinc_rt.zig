@@ -6289,6 +6289,9 @@ const DirectMoeGateUpQ4_0Candidate = struct {
     expert_slot: usize,
 };
 
+const direct_moe_gate_up_q4_0_batched_routed_shared_candidates: usize =
+    @as(usize, direct_moe_gate_up_q4_0_max_expert_slots) + 1;
+
 const DirectMoeDownQ4_0BatchCandidate = struct {
     param: *MoeExpertWorker,
     expert_slot: usize,
@@ -6427,6 +6430,224 @@ fn directMoeGateUpScratch(
     const scratch_base = if (input_sum32) |sums| sums.len else 0;
     if (state.row_scratch.len < scratch_base + needed) return null;
     return state.row_scratch[scratch_base..][0..needed];
+}
+
+fn consumeDirectMoeGateUpQ4_0RoutedSharedBeforeCpuTail(
+    state: *ScalarDecodeState,
+    maybe_tracking: ?DirectComputeTracking,
+    params: []MoeExpertWorker,
+    input_sum32: ?[]const f32,
+    consumed_prefix_rows: []u32,
+) bool {
+    const tracking = maybe_tracking orelse return false;
+    if (tracking.phase != .decode) return false;
+    if (consumed_prefix_rows.len < params.len) return false;
+    if (state.direct_shared_moe_gate_up_row_range_done) return false;
+    if (state.direct_moe_gate_up_row_range_count != 0) return false;
+
+    const range_rows = direct_moe_gate_up_q4_0_range_rows;
+    const range_len: usize = @intCast(range_rows);
+    const max_candidates = direct_moe_gate_up_q4_0_batched_routed_shared_candidates;
+    var candidates: [max_candidates]DirectMoeGateUpQ4_0Candidate = undefined;
+    var candidate_count: usize = 0;
+    var routed_count: usize = 0;
+    var shared_count: usize = 0;
+    var cols: u32 = 0;
+    var row_bytes: usize = 0;
+    var base_ffn_norm_ptr: ?[*]const f32 = null;
+
+    for (params, 0..) |*param, i| {
+        if (candidate_count == candidates.len) break;
+        if (consumed_prefix_rows[i] != 0) continue;
+        if (param.is_shared) {
+            if (shared_count != 0) continue;
+        } else {
+            if (routed_count >= @as(usize, direct_moe_gate_up_q4_0_max_expert_slots)) continue;
+        }
+        if (param.gate_type != .q4_0 or param.up_type != .q4_0) continue;
+        if (param.intermediate_dim < range_rows or param.gate.len < range_len or param.up.len < range_len) continue;
+
+        const param_cols: u32 = @intCast(param.ffn_norm.len);
+        if (param_cols == 0 or param_cols % 32 != 0) continue;
+        const param_row_bytes = rowBytesForType(.q4_0, param_cols);
+        if (param_row_bytes == 0) continue;
+        const range_bytes_for_param = range_len * param_row_bytes;
+        if (param.gate_raw.len < range_bytes_for_param or param.up_raw.len < range_bytes_for_param) continue;
+
+        if (base_ffn_norm_ptr) |base_ptr| {
+            if (param_cols != cols or param.ffn_norm.ptr != base_ptr) continue;
+        } else {
+            cols = param_cols;
+            row_bytes = param_row_bytes;
+            base_ffn_norm_ptr = param.ffn_norm.ptr;
+        }
+
+        candidates[candidate_count] = .{ .param = param, .expert_slot = i };
+        candidate_count += 1;
+        if (param.is_shared) {
+            shared_count += 1;
+        } else {
+            routed_count += 1;
+        }
+    }
+
+    if (routed_count != @as(usize, direct_moe_gate_up_q4_0_max_expert_slots) or shared_count != 1) return false;
+
+    const ranges_per_candidate: usize = 2;
+    const range_count = candidate_count * ranges_per_candidate;
+    const gpu_len = range_count * range_len;
+    const trusted_no_oracle = state.direct_moe_gate_up_row_range_count >= direct_moe_gate_up_q4_0_trust_after_successes;
+    const cpu_len: usize = if (trusted_no_oracle) 0 else gpu_len;
+    const scratch = directMoeGateUpScratch(state, input_sum32, gpu_len + cpu_len) orelse return false;
+    const gpu_rows = scratch[0..gpu_len];
+    const range_bytes = range_len * row_bytes;
+
+    if (candidate_count != direct_moe_gate_up_q4_0_batched_routed_shared_candidates) return false;
+    tracking.boundary.dmmvQ4_0SixRowRangesParallel64(
+        candidates[0].param.ffn_norm[0..@as(usize, @intCast(cols))],
+        candidates[0].param.gate_raw[0..range_bytes],
+        candidates[0].param.up_raw[0..range_bytes],
+        candidates[1].param.gate_raw[0..range_bytes],
+        candidates[1].param.up_raw[0..range_bytes],
+        candidates[2].param.gate_raw[0..range_bytes],
+        candidates[2].param.up_raw[0..range_bytes],
+        cols,
+        gpu_rows,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct MoE routed+shared gate/up Q4_0 batched prefixes unavailable ({s}); retrying smaller gate/up slices", .{@errorName(err)});
+        return false;
+    };
+
+    var max_gate_delta: f32 = 0.0;
+    var max_up_delta: f32 = 0.0;
+    var max_gate_slot: usize = candidates[0].expert_slot;
+    var max_up_slot: usize = candidates[0].expert_slot;
+    var max_gate_row: u32 = 0;
+    var max_up_row: u32 = 0;
+
+    if (!trusted_no_oracle) {
+        const cpu_rows = scratch[gpu_len .. gpu_len + cpu_len];
+        for (candidates[0..candidate_count], 0..) |candidate, ci| {
+            const param = candidate.param;
+            const base = ci * range_len * ranges_per_candidate;
+            matvecRawDirectSerial(param.gate_raw, .q4_0, param.ffn_norm, input_sum32, 0, range_rows, cpu_rows[base..][0..range_len]) catch return false;
+            matvecRawDirectSerial(param.up_raw, .q4_0, param.ffn_norm, input_sum32, 0, range_rows, cpu_rows[base + range_len ..][0..range_len]) catch return false;
+        }
+
+        for (candidates[0..candidate_count], 0..) |candidate, ci| {
+            const base = ci * range_len * ranges_per_candidate;
+            const gate_gpu = gpu_rows[base..][0..range_len];
+            const up_gpu = gpu_rows[base + range_len ..][0..range_len];
+            const gate_cpu = cpu_rows[base..][0..range_len];
+            const up_cpu = cpu_rows[base + range_len ..][0..range_len];
+            for (0..range_len) |i| {
+                if (!std.math.isFinite(gate_gpu[i]) or !std.math.isFinite(up_gpu[i])) {
+                    log.warn("M1 AMDGPU CS direct MoE routed+shared gate/up Q4_0 batched prefixes produced non-finite expert_slot={d} row={d}; retrying smaller gate/up slices", .{ candidate.expert_slot, i });
+                    return false;
+                }
+                const gate_delta = @abs(gate_gpu[i] - gate_cpu[i]);
+                const up_delta = @abs(up_gpu[i] - up_cpu[i]);
+                if (gate_delta > max_gate_delta) {
+                    max_gate_delta = gate_delta;
+                    max_gate_slot = candidate.expert_slot;
+                    max_gate_row = @intCast(i);
+                }
+                if (up_delta > max_up_delta) {
+                    max_up_delta = up_delta;
+                    max_up_slot = candidate.expert_slot;
+                    max_up_row = @intCast(i);
+                }
+            }
+        }
+        if (max_gate_delta > direct_moe_gate_up_q4_0_tolerance or max_up_delta > direct_moe_gate_up_q4_0_tolerance) {
+            log.warn("M1 AMDGPU CS direct MoE routed+shared gate/up Q4_0 batched prefixes mismatch: gate_delta={d:.6} gate_slot={d} gate_row={d} up_delta={d:.6} up_slot={d} up_row={d}; retrying smaller gate/up slices", .{
+                max_gate_delta,
+                max_gate_slot,
+                max_gate_row,
+                max_up_delta,
+                max_up_slot,
+                max_up_row,
+            });
+            return false;
+        }
+    } else {
+        for (gpu_rows, 0..) |gpu, i| {
+            if (!std.math.isFinite(gpu)) {
+                log.warn("M1 AMDGPU CS direct MoE routed+shared gate/up Q4_0 batched prefixes produced non-finite output {d}; retrying smaller gate/up slices", .{i});
+                return false;
+            }
+        }
+    }
+
+    var expert_slot_a: usize = 0;
+    var expert_slot_b: usize = 0;
+    var expert_id_a: u32 = 0;
+    var expert_id_b: u32 = 0;
+    var shared_slot: usize = 0;
+    var routed_seen: usize = 0;
+    for (candidates[0..candidate_count], 0..) |candidate, ci| {
+        const param = candidate.param;
+        const base = ci * range_len * ranges_per_candidate;
+        @memcpy(param.gate[0..range_len], gpu_rows[base..][0..range_len]);
+        @memcpy(param.up[0..range_len], gpu_rows[base + range_len ..][0..range_len]);
+        consumed_prefix_rows[candidate.expert_slot] = range_rows;
+        if (param.is_shared) {
+            state.direct_shared_moe_gate_up_row_range_done = true;
+            shared_slot = candidate.expert_slot;
+        } else {
+            if (routed_seen == 0) {
+                expert_slot_a = candidate.expert_slot;
+                expert_id_a = param.expert_id;
+            } else if (routed_seen == 1) {
+                expert_slot_b = candidate.expert_slot;
+                expert_id_b = param.expert_id;
+            }
+            routed_seen += 1;
+            state.direct_moe_gate_up_row_range_count += 1;
+        }
+    }
+
+    const chunks: u32 = @intCast(range_count);
+    tracking.ops.* += chunks;
+    mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+    tracking.consumed.* = true;
+    tracking.real_model_slice.* = true;
+    if (tracking.decode_model_slices) |slices| slices.* += chunks;
+    if (trusted_no_oracle) {
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_gate_up_q4_0_routed_shared_prefix_before_cpu_tail_batched phase=decode expert_slot_a={d} expert_id_a={d} expert_slot_b={d} expert_id_b={d} shared_slot={d} rows_per_projection={d} cols={d} chunks={d} batch_ranges={d} trust_after_successes={d} validation=finite_only consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            expert_slot_a,
+            expert_id_a,
+            expert_slot_b,
+            expert_id_b,
+            shared_slot,
+            range_rows,
+            cols,
+            chunks,
+            range_count,
+            direct_moe_gate_up_q4_0_trust_after_successes,
+        });
+    } else {
+        log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_gate_up_q4_0_routed_shared_prefix_before_cpu_tail_batched phase=decode expert_slot_a={d} expert_id_a={d} expert_slot_b={d} expert_id_b={d} shared_slot={d} rows_per_projection={d} cols={d} chunks={d} batch_ranges={d} max_gate_delta={d:.6} max_gate_slot={d} max_gate_row={d} max_up_delta={d:.6} max_up_slot={d} max_up_row={d} consumed_gpu_model_value=1", .{
+            tracking.ops.*,
+            expert_slot_a,
+            expert_id_a,
+            expert_slot_b,
+            expert_id_b,
+            shared_slot,
+            range_rows,
+            cols,
+            chunks,
+            range_count,
+            max_gate_delta,
+            max_gate_slot,
+            max_gate_row,
+            max_up_delta,
+            max_up_slot,
+            max_up_row,
+        });
+    }
+    return true;
 }
 
 fn consumeDirectMoeGateUpQ4_0TwoRoutedSlotsBeforeCpuTail(
@@ -6993,14 +7214,24 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
 
     var gate_up_prefix_rows = [_]u32{0} ** moe_expert_parallel_max_workers;
     if (direct_compute_tracking != null) {
-        _ = consumeDirectMoeGateUpQ4_0TwoRoutedSlotsBeforeCpuTail(
+        const routed_shared_batched = consumeDirectMoeGateUpQ4_0RoutedSharedBeforeCpuTail(
             state,
             direct_compute_tracking,
             params,
             input_sum32,
             gate_up_prefix_rows[0..params.len],
         );
+        if (!routed_shared_batched) {
+            _ = consumeDirectMoeGateUpQ4_0TwoRoutedSlotsBeforeCpuTail(
+                state,
+                direct_compute_tracking,
+                params,
+                input_sum32,
+                gate_up_prefix_rows[0..params.len],
+            );
+        }
         for (params, 0..) |*param, i| {
+            if (param.is_shared and !routed_shared_batched and state.direct_moe_gate_up_row_range_count == 0) continue;
             if (!canConsumeDirectMoeGateUpQ4_0Param(state, param)) continue;
             _ = consumeDirectMoeGateUpQ4_0PrefixBeforeCpuTail(
                 state,
@@ -7030,6 +7261,7 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
     if (direct_compute_tracking != null) {
         _ = consumeDirectMoeGateUpQ4_0TwoRoutedSlots(state, direct_compute_tracking, params);
         for (params, 0..) |*param, i| {
+            if (param.is_shared and state.direct_moe_gate_up_row_range_count == 0) continue;
             if (!canConsumeDirectMoeGateUpQ4_0Param(state, param)) continue;
             consumeDirectMoeGateUpQ4_0Rows(state, direct_compute_tracking, param, i);
         }
