@@ -6127,7 +6127,7 @@ const direct_moe_gate_up_q4_0_max_expert_slots: u32 = 2;
 const direct_moe_gate_up_q4_0_trust_after_successes: u32 = 1;
 const direct_moe_down_q4_0_tolerance: f32 = 0.05;
 const direct_moe_down_q4_0_chunk_rows: u32 = 64;
-const direct_moe_down_q4_0_range_rows: u32 = direct_moe_down_q4_0_chunk_rows * 4;
+const direct_moe_down_q4_0_range_rows: u32 = direct_moe_down_q4_0_chunk_rows * 8;
 const direct_moe_down_q4_0_max_expert_slots: u32 = 4;
 const direct_moe_down_q4_0_trust_after_successes: u32 = 1;
 
@@ -10815,7 +10815,7 @@ test "direct MoE down Q4_0 prefix uses chunk-aligned row ranges" {
     try std.testing.expectEqual(@as(u32, 1), direct_moe_gate_up_q4_0_trust_after_successes);
     try std.testing.expect(direct_moe_down_q4_0_range_rows > direct_moe_down_q4_0_chunk_rows);
     try std.testing.expectEqual(@as(u32, 0), direct_moe_down_q4_0_range_rows % direct_moe_down_q4_0_chunk_rows);
-    try std.testing.expectEqual(@as(u32, 4), directMoeDownQ4_0RangeChunks(direct_moe_down_q4_0_range_rows));
+    try std.testing.expectEqual(@as(u32, 8), directMoeDownQ4_0RangeChunks(direct_moe_down_q4_0_range_rows));
     try std.testing.expectEqual(@as(u32, 0), directMoeDownQ4_0RangeChunks(direct_moe_down_q4_0_chunk_rows - 1));
 }
 
