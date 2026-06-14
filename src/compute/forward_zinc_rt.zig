@@ -6289,6 +6289,13 @@ const DirectMoeGateUpQ4_0Candidate = struct {
     expert_slot: usize,
 };
 
+const DirectMoeDownQ4_0BatchCandidate = struct {
+    param: *MoeExpertWorker,
+    expert_slot: usize,
+    input_sum32: ?[]const f32,
+    output_offset: usize,
+};
+
 fn consumeDirectMoeGateUpQ4_0TwoRoutedSlots(
     state: *ScalarDecodeState,
     maybe_tracking: ?DirectComputeTracking,
@@ -7029,6 +7036,8 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
     }
 
     var down: [moe_expert_parallel_max_workers]MultiInputFusedSegment = undefined;
+    var down_input_sums: [moe_expert_parallel_max_workers]?[]const f32 = .{null} ** moe_expert_parallel_max_workers;
+    var down_prefix_rows = [_]u32{0} ** moe_expert_parallel_max_workers;
     for (params, 0..) |*param, i| {
         if (param.use_gelu) {
             geluGate(param.gate, param.up, param.swiglu_out);
@@ -7047,6 +7056,7 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
             }
             break :sums null;
         };
+        down_input_sums[i] = down_input_sum32;
         down[i] = .{
             .raw = param.down_raw,
             .type_ = param.down_type,
@@ -7055,13 +7065,29 @@ fn runMoeExpertsParallelPhased(state: *ScalarDecodeState, params: []MoeExpertWor
             .rows = param.hidden_dim,
             .out = param.down,
         };
-        const direct_prefix_rows = consumeDirectMoeDownQ4_0PrefixBeforeCpuTail(
+    }
+    if (direct_compute_tracking != null) {
+        _ = consumeDirectMoeDownQ4_0PrefixesBeforeCpuTail(
             state,
             direct_compute_tracking,
-            param,
-            i,
-            down_input_sum32,
+            params,
+            down_input_sums[0..params.len],
+            down_prefix_rows[0..params.len],
         );
+        for (params, 0..) |*param, i| {
+            if (down_prefix_rows[i] != 0) continue;
+            if (!canConsumeDirectMoeDownQ4_0Param(state, param)) continue;
+            down_prefix_rows[i] = consumeDirectMoeDownQ4_0PrefixBeforeCpuTail(
+                state,
+                direct_compute_tracking,
+                param,
+                i,
+                down_input_sums[i],
+            );
+        }
+    }
+    for (params, 0..) |*param, i| {
+        const direct_prefix_rows = down_prefix_rows[i];
         if (direct_prefix_rows != 0 and direct_prefix_rows < down[i].rows) {
             const row_bytes = rowBytesForType(.q4_0, param.intermediate_dim);
             const prefix_bytes = @as(usize, direct_prefix_rows) * row_bytes;
@@ -7098,6 +7124,215 @@ fn canConsumeDirectMoeDownQ4_0Param(state: *const ScalarDecodeState, param: *con
 fn directMoeDownQ4_0RangeChunks(rows: u32) u32 {
     if (rows == 0 or rows % direct_moe_down_q4_0_chunk_rows != 0) return 0;
     return rows / direct_moe_down_q4_0_chunk_rows;
+}
+
+fn consumeDirectMoeDownQ4_0PrefixesBeforeCpuTail(
+    state: *ScalarDecodeState,
+    maybe_tracking: ?DirectComputeTracking,
+    params: []MoeExpertWorker,
+    input_sums: []const ?[]const f32,
+    consumed_prefix_rows: []u32,
+) bool {
+    const tracking = maybe_tracking orelse return false;
+    if (tracking.phase != .decode) return false;
+    if (input_sums.len < params.len or consumed_prefix_rows.len < params.len) return false;
+
+    const range_rows = direct_moe_down_q4_0_range_rows;
+    const range_chunks = directMoeDownQ4_0RangeChunks(range_rows);
+    if (range_chunks == 0) return false;
+    const range_len: usize = @intCast(range_rows);
+    const routed_available = direct_moe_down_q4_0_max_expert_slots -| state.direct_moe_down_row_range_count;
+    const reserve_oracle_rows: usize = if (state.direct_moe_down_row_range_count < direct_moe_down_q4_0_trust_after_successes) range_len else 0;
+
+    var candidates: [moe_expert_parallel_max_workers]DirectMoeDownQ4_0BatchCandidate = undefined;
+    var batches: [moe_expert_parallel_max_workers]zinc_rt.cs.DmmvQ4_0RowRangeBatch = undefined;
+    var candidate_count: usize = 0;
+    var routed_count: u32 = 0;
+    var shared_count: u32 = 0;
+    var total_rows: usize = 0;
+
+    for (params, 0..) |*param, i| {
+        if (consumed_prefix_rows[i] != 0) continue;
+        if (param.is_shared) {
+            if (shared_count != 0 or state.direct_shared_moe_down_row_range_done) continue;
+        } else {
+            if (routed_count >= routed_available) continue;
+        }
+        if (param.down_type != .q4_0) continue;
+        if (param.hidden_dim < range_rows) continue;
+        if (param.intermediate_dim == 0 or param.swiglu_out.len < param.intermediate_dim) continue;
+        if (param.down.len < range_len) continue;
+
+        const cols = param.intermediate_dim;
+        if (cols == 0 or cols % 32 != 0) continue;
+        const cols_usize: usize = @intCast(cols);
+        const row_bytes = rowBytesForType(.q4_0, cols);
+        const range_bytes = range_len * row_bytes;
+        if (row_bytes == 0 or param.down_raw.len < range_bytes) continue;
+        if (total_rows + range_len + reserve_oracle_rows > state.row_scratch.len) break;
+
+        candidates[candidate_count] = .{
+            .param = param,
+            .expert_slot = i,
+            .input_sum32 = input_sums[i],
+            .output_offset = total_rows,
+        };
+        batches[candidate_count] = .{
+            .input = param.swiglu_out[0..cols_usize],
+            .weights_q4_0 = param.down_raw[0..range_bytes],
+            .rows = range_rows,
+            .cols = cols,
+        };
+        candidate_count += 1;
+        total_rows += range_len;
+        if (param.is_shared) {
+            shared_count += 1;
+        } else {
+            routed_count += 1;
+        }
+    }
+    if (candidate_count < 2) return false;
+
+    const gpu_rows = state.row_scratch[0..total_rows];
+    tracking.boundary.dmmvQ4_0RowRangeParallelBatches(
+        batches[0..candidate_count],
+        gpu_rows,
+    ) catch |err| {
+        log.warn("M1 AMDGPU CS direct MoE down Q4_0 batched prefixes unavailable ({s}); retrying per-expert prefixes", .{@errorName(err)});
+        return false;
+    };
+
+    var consumed_any = false;
+    for (candidates[0..candidate_count]) |candidate| {
+        const param = candidate.param;
+        const rows = gpu_rows[candidate.output_offset..][0..range_len];
+        var finite = true;
+        for (rows, 0..) |gpu, row| {
+            if (!std.math.isFinite(gpu)) {
+                finite = false;
+                if (param.is_shared) {
+                    log.warn("M1 AMDGPU CS direct shared MoE down Q4_0 batched prefix produced non-finite row {d}; shared down projection remains host-computed", .{row});
+                } else {
+                    log.warn("M1 AMDGPU CS direct MoE expert down Q4_0 batched prefix produced non-finite row {d}; down projection remains host-computed", .{row});
+                }
+                break;
+            }
+        }
+        if (!finite) continue;
+
+        const trusted_no_oracle = state.direct_moe_down_row_range_count >= direct_moe_down_q4_0_trust_after_successes;
+        var max_down_delta: f32 = 0.0;
+        var max_down_row: u32 = 0;
+        if (!trusted_no_oracle) {
+            if (total_rows + range_len > state.row_scratch.len) continue;
+            const cpu_rows = state.row_scratch[total_rows .. total_rows + range_len];
+            matvecRawDirectSerial(
+                param.down_raw,
+                .q4_0,
+                param.swiglu_out[0..@as(usize, @intCast(param.intermediate_dim))],
+                candidate.input_sum32,
+                0,
+                range_rows,
+                cpu_rows,
+            ) catch {
+                if (param.is_shared) {
+                    log.warn("M1 AMDGPU CS direct shared MoE down Q4_0 batched prefix CPU oracle failed; shared down projection remains host-computed", .{});
+                } else {
+                    log.warn("M1 AMDGPU CS direct MoE expert down Q4_0 batched prefix CPU oracle failed; down projection remains host-computed", .{});
+                }
+                continue;
+            };
+            for (0..range_len) |i| {
+                const delta = @abs(rows[i] - cpu_rows[i]);
+                if (delta > max_down_delta) {
+                    max_down_delta = delta;
+                    max_down_row = @intCast(i);
+                }
+            }
+            if (max_down_delta > direct_moe_down_q4_0_tolerance) {
+                if (param.is_shared) {
+                    log.warn("M1 AMDGPU CS direct shared MoE down Q4_0 batched prefix mismatch: expert_slot={d} down_delta={d:.6} down_row={d}; shared down projection remains host-computed", .{
+                        candidate.expert_slot,
+                        max_down_delta,
+                        max_down_row,
+                    });
+                } else {
+                    log.warn("M1 AMDGPU CS direct MoE expert down Q4_0 batched prefix mismatch: expert_slot={d} expert_id={d} down_delta={d:.6} down_row={d}; down projection remains host-computed", .{
+                        candidate.expert_slot,
+                        param.expert_id,
+                        max_down_delta,
+                        max_down_row,
+                    });
+                }
+                continue;
+            }
+        }
+
+        @memcpy(param.down[0..range_len], rows);
+        consumed_prefix_rows[candidate.expert_slot] = range_rows;
+        if (param.is_shared) {
+            state.direct_shared_moe_down_row_range_done = true;
+        } else {
+            state.direct_moe_down_row_range_count += 1;
+        }
+        tracking.ops.* += range_chunks;
+        mergeDirectComputeKind(tracking.kind, .dmmv_row_range);
+        tracking.consumed.* = true;
+        tracking.real_model_slice.* = true;
+        if (tracking.decode_model_slices) |slices| slices.* += range_chunks;
+        consumed_any = true;
+
+        if (param.is_shared) {
+            if (trusted_no_oracle) {
+                log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_shared_down_q4_0_prefix_before_cpu_tail_batched phase=decode expert_slot={d} rows={d} cols={d} chunks={d} batch_ranges={d} trust_after_successes={d} validation=finite_only consumed_gpu_model_value=1", .{
+                    tracking.ops.*,
+                    candidate.expert_slot,
+                    range_rows,
+                    param.intermediate_dim,
+                    range_chunks,
+                    candidate_count,
+                    direct_moe_down_q4_0_trust_after_successes,
+                });
+            } else {
+                log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_shared_down_q4_0_prefix_before_cpu_tail_batched phase=decode expert_slot={d} rows={d} cols={d} chunks={d} batch_ranges={d} max_down_delta={d:.6} max_down_row={d} consumed_gpu_model_value=1", .{
+                    tracking.ops.*,
+                    candidate.expert_slot,
+                    range_rows,
+                    param.intermediate_dim,
+                    range_chunks,
+                    candidate_count,
+                    max_down_delta,
+                    max_down_row,
+                });
+            }
+        } else {
+            if (trusted_no_oracle) {
+                log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_expert_down_q4_0_prefix_before_cpu_tail_batched phase=decode expert_slot={d} expert_id={d} rows={d} cols={d} chunks={d} batch_ranges={d} trust_after_successes={d} validation=finite_only consumed_gpu_model_value=1", .{
+                    tracking.ops.*,
+                    candidate.expert_slot,
+                    param.expert_id,
+                    range_rows,
+                    param.intermediate_dim,
+                    range_chunks,
+                    candidate_count,
+                    direct_moe_down_q4_0_trust_after_successes,
+                });
+            } else {
+                log.info("M1 AMDGPU CS direct model slice consumed: direct_compute_ops={d} direct_compute_kind=dmmv_row_range op=moe_expert_down_q4_0_prefix_before_cpu_tail_batched phase=decode expert_slot={d} expert_id={d} rows={d} cols={d} chunks={d} batch_ranges={d} max_down_delta={d:.6} max_down_row={d} consumed_gpu_model_value=1", .{
+                    tracking.ops.*,
+                    candidate.expert_slot,
+                    param.expert_id,
+                    range_rows,
+                    param.intermediate_dim,
+                    range_chunks,
+                    candidate_count,
+                    max_down_delta,
+                    max_down_row,
+                });
+            }
+        }
+    }
+    return consumed_any;
 }
 
 fn consumeDirectMoeDownQ4_0PrefixBeforeCpuTail(
