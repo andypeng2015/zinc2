@@ -787,3 +787,45 @@ attention is a smaller FLOP share). Stacks on the head-skip's +4%.
   current 3-pass `gemma_attention_batched` re-reads K/V from global once per query block (O(T²) K/V traffic per head). A
   query-tiled kernel that loads a K/V tile once for a block of queries (own token-correctness gate, fp/online-softmax →
   not byte-identical) is the genuine remaining large-T win.
+- **2026-06-13 — Cycle 22: query-tiled FLASH batched attention kernel — token-correct, but PERF NEGATIVE at large T (hypothesis FALSIFIED) → kept OPT-IN.**
+  Took cycle 20/21's NEXT: the 3-pass `gemma_attention_batched` re-reads K[0..t]+V[0..t] from GLOBAL once per (head,t)
+  block → summed over t = O(T²) K/V global traffic per head, the suspected large-T bottleneck (grouped+TC sweeps PEAK at
+  T≈750, DROP by T=1500). Added an ADDITIVE flash kernel `gemma_attention_flash` (kernels.cu) that processes a TILE of
+  BQ = blockDim.x/32 = 8 consecutive queries per block (ONE WARP per query) and streams K/V through shared-memory tiles of
+  `bk` keys (bk = 3072/hd ≈ 12 for gemma's hd=256 → 24 KB Ksh|Vsh) reused by ALL 8 queries → each K/V position read from
+  global once per 8 queries instead of once per query (≈8× less K/V traffic). Online (running max/sum) softmax with output
+  rescaling; SAME scale / GQA / causal + sliding-window mask as `gemma_attention(_batched)`. NOT bit-identical (different
+  summation order + online rescaling) → token-correctness gate, NOT GEN byte-identity. ADDITIVE (decodeStep/per-token path/
+  the default 3-pass batched path all untouched; default toggle-off = byte-for-byte the proven cycle-2 `gemma_attention_batched`):
+    - 1 ADDITIVE kernel `gemma_attention_flash` + `GemmaAttnFlashPush` (adds `bk`) + pipeline. Uniform block-wide key-tile
+      loop bound (`tile0..block_max`) so every thread hits the two `__syncthreads` the same number of times (no divergent
+      sync); inactive warps (qi≥T) still cooperatively stage the shared tile. Per-lane dim chunk (hd≤512), q held in
+      registers, acc accumulated online; warp-reduce + lane-0 broadcast for each q·k dot.
+    - Opt-in bool `use_flash` (`ZINC_BATCHED_FLASH`, read once in `prefillBatched`); `attentionLayerBatched` dispatches the
+      flash kernel grid=(n_head, ⌈T/8⌉) when set, else the unchanged 3-pass dispatch. New `scripts/flash_sweep.sh` (ABBA
+      T-sweep, REPORTS tok-match informationally) + `ZINC_BATCHED_FLASH` passthrough in prefill_catalog/validate_catalog.
+  Built clean on the 4090 box (fresh `.zig-cache`, `zig build cuda-dbg -Dbackend=cuda -Dshaders=false` EXIT=0, NVRTC compiled
+  the new kernel; bin md5 e7a06cc0 ≠ cycle 21's da0b59d5). GATE:
+    - TOKEN-CORRECTNESS (the gate for the non-bit-identical flash family): `ZINC_BATCHED=1 ZINC_BATCHED_FLASH=1
+      validate_catalog` (4090): **5/5 PASS** — gemma4-26b MoE (flash attention on the batched path) free-runs **12/12**
+      DIRECT vs llama.cpp; gemma4-31b the SAME documented near-tie (free-run 2/12, teacher-forced 11/12 — flash introduced
+      NO new divergence); qwen 12/12 (per-token fallback). Direct A/B smoke (gemma-31b T=120): flash GEN_IDS == 3-pass.
+    - PERF — NEGATIVE at large T (the honest outcome, hypothesis FALSIFIED): `scripts/flash_sweep.sh` (gemma-31b dense, ABBA
+      x2, 4090, tok-match "yes/no divergence" at every T): **T=250 125.86→132.45 (+5.2%)**, **T=750 142.42→142.29 (−0.1%)**,
+      **T=1500 120.94→101.66 (−15.9%)**. The win was expected to GROW with T (attention's O(T²) share rises); instead it
+      INVERTS — marginally positive at small T, sharply negative at the large T it was built for.
+  ROOT CAUSE: the one-warp-per-query design is PARALLELISM-STARVED in the prefill regime. The 3-pass `gemma_attention_batched`
+  assigns a FULL 256-thread block to EACH query and parallelizes the key-dimension reduction across all 256 threads; the flash
+  kernel gives each query just ONE 32-lane warp that loops over up to T keys SERIALLY (only the hd-dim dot is warp-parallel).
+  At T=1500 that serial per-warp key loop (~1500 iterations) dominates, and the K/V-traffic saving (which IS real — tok-match
+  holds) cannot cover the lost key-dim parallelism. Same class as cycles 14/17 (a clean hypothesis, measured, falsified) — so
+  flash stays OPT-IN (`ZINC_BATCHED_FLASH`, off by default → the default batched path is byte-for-byte the proven 3-pass
+  `gemma_attention_batched`, cannot regress) and is documented so a future cycle does NOT re-attempt warp-per-query. The
+  K/V-reuse idea is NOT dead — but the correct shape is a BLOCK-COOPERATIVE flash (a full block per query-or-query-pair that
+  parallelizes the key reduction like the 3-pass kernel WHILE tiling K/V in shared), a larger rewrite, not the warp-per-query
+  kernel landed here. Committed to perf/e24-batched-prefill, pushed (NOT main; branch independent of main, no rebase). NEXT
+  (cycle 23): EITHER the block-cooperative flash redesign above (keep the 3-pass kernel's key-dim parallelism, add K/V shared
+  tiling — the only attention lever with a real path to a large-T win), OR accept attention is not the prefill bottleneck on
+  this box (the 3-pass kernel is already block-parallel and the dense TC GEMM is the proven ~+20-30% lever from cycle 20) and
+  pivot to a strict-byte-identity MERGE of the proven batched dense+MoE path (the gate has been 5/5 for many cycles; the
+  branch's mergeable core is the f32/3-pass byte-identical path, with TC/flash/grouped as documented opt-ins).

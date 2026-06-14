@@ -2895,6 +2895,120 @@ extern "C" __global__ void gemma_attention_batched(const float* q, const float* 
     }
 }
 
+// ---- gemma_attention_flash (Effort 24 cycle 22: query-tiled flash attention) ----
+// Cuts the O(T^2) K/V GLOBAL re-reads of gemma_attention_batched (each (head,t)
+// block reads K[0..t]+V[0..t] from global → summed over t = O(T^2) per head) by
+// processing a TILE of BQ = blockDim.x/32 consecutive queries per block (ONE WARP
+// per query) and streaming K/V in shared-memory tiles of `bk` keys that ALL BQ
+// queries in the block reuse → each K/V position is read from global once per BQ
+// queries instead of once per query (≈ BQ× less K/V traffic, the large-T lever).
+// Online (running max/sum) softmax with output rescaling; SAME scale / GQA / causal
+// + sliding-window mask as gemma_attention(_batched). NOT bit-identical to the
+// 3-pass kernels (different summation order + online rescaling) → token-correctness
+// gate (same class as the fp16 TC path), NOT GEN byte-identity. Q token-major
+// [T,n_heads,hd]; K/V the prompt region [0..T) of the cache [T,n_kv_heads,hd];
+// out token-major [T,n_heads,hd]. Dynamic shared = bk*hd*2 floats (Ksh | Vsh).
+struct GemmaAttnFlashPush { unsigned head_dim, n_heads, n_kv_heads, T, scale_bits, window, bk; };
+extern "C" __global__ void gemma_attention_flash(const float* q, const float* k, const float* v,
+                                                 float* out, GemmaAttnFlashPush pc) {
+    extern __shared__ float smem[];
+    unsigned hd = pc.head_dim;
+    unsigned bk = pc.bk;
+    float* Ksh = smem;             // [bk, hd]
+    float* Vsh = smem + bk * hd;   // [bk, hd]
+    unsigned head = blockIdx.x;
+    unsigned tid = threadIdx.x;
+    unsigned lane = tid & 31u;
+    unsigned warp = tid >> 5;
+    unsigned nwarps = blockDim.x >> 5;             // = BQ queries per block
+    unsigned q0 = blockIdx.y * nwarps;             // first query of this block's tile
+    unsigned qi = q0 + warp;                       // this warp's query position
+    unsigned kv_head = head / (pc.n_heads / pc.n_kv_heads);
+    float scale = pc.scale_bits != 0u ? __uint_as_float(pc.scale_bits) : rsqrtf((float)hd);
+    bool active = (qi < pc.T);
+    unsigned seq_len = active ? qi + 1u : 0u;      // causal: query qi attends keys [0..qi]
+    unsigned start_i = (pc.window != 0u && seq_len > pc.window) ? seq_len - pc.window : 0u;
+
+    // Per-lane dim chunk: lane handles dims {lane, lane+32, ...}. q held once in
+    // registers; acc accumulated online. hd <= 32*MAXDPL (512 → covers gemma).
+    const int MAXDPL = 16;
+    float qreg[MAXDPL];
+    float acc[MAXDPL];
+    int dpl = (int)((hd + 31u) / 32u);
+    const float* qh = q + ((size_t)qi * pc.n_heads + head) * hd;   // valid only if active
+    #pragma unroll
+    for (int r = 0; r < MAXDPL; r++) {
+        if (r < dpl) {
+            unsigned d = lane + (unsigned)r * 32u;
+            qreg[r] = (active && d < hd) ? qh[d] : 0.0f;
+            acc[r] = 0.0f;
+        }
+    }
+    float m = -3.4e38f, l = 0.0f;
+
+    // Block-wide key range: keys [block_start .. block_max) cover EVERY query in
+    // the tile (block_max = largest qi+1 here; block_start = smallest query's SWA
+    // start). The `base` loop bound is UNIFORM across the block so every thread
+    // hits the two __syncthreads the same number of times (no divergent sync).
+    unsigned block_max = (q0 + nwarps <= pc.T ? q0 + nwarps : pc.T);  // exclusive key bound
+    unsigned block_min_seq = q0 + 1u;
+    unsigned block_start = (pc.window != 0u && block_min_seq > pc.window) ? block_min_seq - pc.window : 0u;
+    unsigned tile0 = (block_start / bk) * bk;
+
+    for (unsigned base = tile0; base < block_max; base += bk) {
+        unsigned tile_n = (base + bk <= block_max) ? bk : (block_max - base);
+        // Cooperatively stage the K/V tile into shared (ALL threads, incl. inactive warps).
+        for (unsigned e = tid; e < tile_n * hd; e += blockDim.x) {
+            unsigned kk = e / hd, dd = e % hd;
+            Ksh[e] = k[((size_t)(base + kk) * pc.n_kv_heads + kv_head) * hd + dd];
+            Vsh[e] = v[((size_t)(base + kk) * pc.n_kv_heads + kv_head) * hd + dd];
+        }
+        __syncthreads();
+        if (active) {
+            for (unsigned jj = 0; jj < tile_n; jj++) {
+                unsigned j = base + jj;
+                if (j > qi) break;          // causal: keys ascending, none beyond qi count
+                if (j < start_i) continue;  // sliding window
+                float partial = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < MAXDPL; r++) {
+                    if (r < dpl) {
+                        unsigned d = lane + (unsigned)r * 32u;
+                        if (d < hd) partial += qreg[r] * Ksh[jj * hd + d];
+                    }
+                }
+                float s = zinc_warp_reduce_sum(partial);
+                s = __shfl_sync(0xffffffffu, s, 0) * scale;   // broadcast lane0 → whole warp
+                float m_new = fmaxf(m, s);
+                float corr = expf(m - m_new);
+                float p = expf(s - m_new);
+                l = l * corr + p;
+                #pragma unroll
+                for (int r = 0; r < MAXDPL; r++) {
+                    if (r < dpl) {
+                        unsigned d = lane + (unsigned)r * 32u;
+                        float vv = (d < hd) ? Vsh[jj * hd + d] : 0.0f;
+                        acc[r] = acc[r] * corr + p * vv;
+                    }
+                }
+                m = m_new;
+            }
+        }
+        __syncthreads();               // fence the shared tile before the next reload
+    }
+    if (active) {
+        float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+        float* oh = out + ((size_t)qi * pc.n_heads + head) * hd;
+        #pragma unroll
+        for (int r = 0; r < MAXDPL; r++) {
+            if (r < dpl) {
+                unsigned d = lane + (unsigned)r * 32u;
+                if (d < hd) oh[d] = acc[r] * inv;
+            }
+        }
+    }
+}
+
 // ---- deinterleave_qgate (qwen35 packed Q+gate projection) ----
 // wq outputs [2*head_dim] per head, laid out as [Q(head_dim) | gate(head_dim)]
 // interleaved across heads: [Q0,g0,Q1,g1,...]. Split into contiguous q_out and

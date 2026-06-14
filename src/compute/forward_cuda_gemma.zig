@@ -66,6 +66,16 @@ const GemmaAttnBatchPush = extern struct {
     scale_bits: u32,
     window: u32,
 };
+// Cycle 22: query-tiled flash attention push — adds `bk` (keys per shared tile).
+const GemmaAttnFlashPush = extern struct {
+    head_dim: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    T: u32,
+    scale_bits: u32,
+    window: u32,
+    bk: u32,
+};
 const RmsRopePush = extern struct { head_dim: u32, eps: f32, rope_dim: u32, position: u32, dst_offset: u32 };
 const RmsKvWritePush = extern struct { head_dim: u32, eps: f32, dst_offset: u32 };
 // Batched-prefill twins (grid.y = T): explicit per-token src/dst strides.
@@ -163,6 +173,7 @@ const Pipelines = struct {
     rope: CudaPipeline,
     gemma_attention: CudaPipeline,
     gemma_attention_batched: CudaPipeline,
+    gemma_attention_flash: CudaPipeline,
     geglu: CudaPipeline,
     scale_accumulate: CudaPipeline,
     scalar_mul: CudaPipeline,
@@ -346,6 +357,7 @@ pub const ForwardGemma = struct {
     use_grouped: bool = false, // cycle 18: ZINC_BATCHED_EXPERTS_GROUPED opts into token-GROUPED routed experts (build_expert_order + grouped matvecs → expert weight L2-resident across its tokens). Byte-identical to the cycle-8 _batched path; opt-in pending a measured win.
     use_tc_m128_lowsmem: bool = false, // cycle 17 A/B: ZINC_BATCHED_TC_M128_LOWSMEM opts INTO the 12 KB-shared wider 128x64 M-tile Q4_K TC kernel (gemm_q4k_tc_f16a_m128_lowsmem) — synthesis of cycle 14's wider tile (halves the dominant f16-A read) + cycle 15's two-phase Cs (12 KB shared → ~6 blocks/SM, NOT m128's 44 KB→1 block/SM that lost -11.8%). Byte-identical to the m64/lowsmem default; measured this cycle to decide if it becomes the default.
     use_tc_sharea: bool = false, // cycle 19: ZINC_BATCHED_TC_SHAREA shares ONE f32→f16 activation recast across GEMMs that read the SAME input (attn Q/K/V from b.norm; FFN gate/up from b.ffn_norm) — skips the redundant per-GEMM f32_to_f16 launch + read for the 2nd/3rd GEMM of each group. Byte-identical (same __float2half bits, same act_f16 contents reused stream-ordered). Off → each GEMM recasts independently (cycle 12 behavior).
+    use_flash: bool = false, // cycle 22: ZINC_BATCHED_FLASH routes the batched prefill attention through gemma_attention_flash — a query-tiled flash kernel (one warp/query, BQ=8 queries/block share shared-memory K/V tiles) that reads each K/V position from global once per BQ queries instead of once per query, cutting gemma_attention_batched's O(T²) K/V global traffic at large T. Online softmax → token-correct, NOT bit-identical → its own gate (validate_catalog), opt-in pending a measured win. Off → the proven cycle-2 gemma_attention_batched (byte-identical to per-token).
     use_tc_normf16: bool = false, // cycle 21: ZINC_BATCHED_TC_NORMF16 has the norm/GeGLU PRODUCERS emit fp16 directly into act_f16 (rms_norm_f16/geglu_f16) so ALL the dense TC GEMMs reading a produced activation (attn Q/K/V from the pre-attn norm; FFN gate/up from the pre-FFN norm; ffn_down from GeGLU) skip their per-GEMM f32→fp16 recast launch ENTIRELY — not just the shared-A dedup. Byte-identical to the per-GEMM-recast TC path (the producer __float2half's the SAME f32 value f32_to_f16 would). Off → cycle-12 per-GEMM recast.
 
     pub fn init(allocator: std.mem.Allocator, model: *loader.Model, max_ctx: u32) !ForwardGemma {
@@ -431,6 +443,7 @@ pub const ForwardGemma = struct {
         pipes.rope = try pipeline.createPipeline(ctx, src.ptr, "rope");
         pipes.gemma_attention = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention");
         pipes.gemma_attention_batched = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention_batched");
+        pipes.gemma_attention_flash = try pipeline.createPipeline(ctx, src.ptr, "gemma_attention_flash");
         pipes.geglu = try pipeline.createPipeline(ctx, src.ptr, "geglu");
         pipes.scale_accumulate = try pipeline.createPipeline(ctx, src.ptr, "scale_accumulate");
         pipes.scalar_mul = try pipeline.createPipeline(ctx, src.ptr, "scalar_mul");
@@ -772,6 +785,12 @@ pub const ForwardGemma = struct {
         // recasts). Byte-identical to the per-GEMM-recast TC path; only meaningful with
         // ZINC_BATCHED_TC. Implies the shared-A reuse for the consumer GEMMs.
         self.use_tc_normf16 = std.posix.getenv("ZINC_BATCHED_TC_NORMF16") != null;
+        // Cycle 22: ZINC_BATCHED_FLASH routes the batched prefill attention through the
+        // query-tiled flash kernel (gemma_attention_flash) — cuts gemma_attention_batched's
+        // O(T²) K/V global re-reads (the large-T attention bottleneck the grouped+TC sweeps
+        // exposed) by reusing shared-memory K/V tiles across a block's BQ queries. Online
+        // softmax → token-correct (not bit-identical) → its own validate_catalog gate.
+        self.use_flash = std.posix.getenv("ZINC_BATCHED_FLASH") != null;
 
         const b = try self.ensureBatch(T);
 
@@ -945,15 +964,35 @@ pub const ForwardGemma = struct {
         // prompt region [0..T) of the KV cache; writes b.attn_out (token-major).
         // Replaces the T per-token gemma_attention launches; bit-identical math.
         const window: u32 = if (g.is_swa) d.sliding_window else 0;
-        const attn = GemmaAttnBatchPush{
-            .head_dim = g.head_dim,
-            .n_heads = d.n_head,
-            .n_kv_heads = g.n_kv_head,
-            .T = T,
-            .scale_bits = @bitCast(@as(f32, 1.0)),
-            .window = window,
-        };
-        cmd.dispatch(&self.pipes.gemma_attention_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &b.attn_out }, &attn, @sizeOf(GemmaAttnBatchPush), T * 4);
+        if (self.use_flash) {
+            // Cycle 22: query-tiled flash attention. BQ = 8 queries/block (256 thr / 32);
+            // grid.y = ceil(T / 8). Each block streams `bk` keys at a time through shared
+            // (Ksh|Vsh) reused by all 8 queries → ~8× less K/V global traffic at large T.
+            // bk sized so the shared tile (bk*hd*2 floats) stays ~24 KB (good occupancy).
+            const bq: u32 = 8;
+            const bk: u32 = @max(@as(u32, 1), 3072 / g.head_dim);
+            const flash = GemmaAttnFlashPush{
+                .head_dim = g.head_dim,
+                .n_heads = d.n_head,
+                .n_kv_heads = g.n_kv_head,
+                .T = T,
+                .scale_bits = @bitCast(@as(f32, 1.0)),
+                .window = window,
+                .bk = bk,
+            };
+            const flash_sh = bk * g.head_dim * 2 * f4;
+            cmd.dispatch(&self.pipes.gemma_attention_flash, .{ d.n_head, (T + bq - 1) / bq, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &b.attn_out }, &flash, @sizeOf(GemmaAttnFlashPush), flash_sh);
+        } else {
+            const attn = GemmaAttnBatchPush{
+                .head_dim = g.head_dim,
+                .n_heads = d.n_head,
+                .n_kv_heads = g.n_kv_head,
+                .T = T,
+                .scale_bits = @bitCast(@as(f32, 1.0)),
+                .window = window,
+            };
+            cmd.dispatch(&self.pipes.gemma_attention_batched, .{ d.n_head, T, 1 }, .{ 256, 1, 1 }, &.{ &b.q, &self.kv_k[L], &self.kv_v[L], &b.attn_out }, &attn, @sizeOf(GemmaAttnBatchPush), T * 4);
+        }
 
         // Batched O projection then the fused post-attention norm + residual add.
         self.gemmDispatch(&cmd, wo, &b.attn_out, &b.o, d.n_embd, g.q_dim, T);

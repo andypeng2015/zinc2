@@ -65,7 +65,11 @@ case "$MODE" in
             [ "${ZINC_BATCHED_TC_SHAREA:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC_SHAREA=1"; S_LABEL="$S_LABEL+sharea"; }
             # Cycle 21: norm/GeGLU producers emit fp16 directly into act_f16, dropping
             # the per-GEMM recast (byte-identical → GEN_IDS must still match; perf knob).
-            [ "${ZINC_BATCHED_TC_NORMF16:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC_NORMF16=1"; S_LABEL="$S_LABEL+normf16"; } ;;
+            [ "${ZINC_BATCHED_TC_NORMF16:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_TC_NORMF16=1"; S_LABEL="$S_LABEL+normf16"; }
+            # Cycle 22: route batched attention through the query-tiled flash kernel
+            # (online softmax → NOT byte-identical; validate_catalog is its gate, this
+            # measures the large-T K/V-traffic win).
+            [ "${ZINC_BATCHED_FLASH:-0}" = "1" ] && { S_ENV="$S_ENV ZINC_BATCHED_FLASH=1"; S_LABEL="$S_LABEL+flash"; } ;;
   *) echo "unknown ZINC_AB '$MODE' (want headskip|batched)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")/.." && pwd)
