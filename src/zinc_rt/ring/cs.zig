@@ -212,6 +212,7 @@ const compute_pgm_rsrc1_vgpr16_value: u32 = (compute_pgm_rsrc1_value & ~@as(u32,
 const compute_pgm_rsrc1_vgpr32_value: u32 = (compute_pgm_rsrc1_value & ~@as(u32, 0x3f)) | 0x7;
 const compute_pgm_rsrc2_argmax_top2_value: u32 = 0x90; // 8 user SGPRs + workgroup-id-x.
 const compute_pgm_rsrc2_user8_vgpr_workitem_x_value: u32 = (8 << 1) | (1 << 11);
+const compute_pgm_rsrc2_user8_tgid_x_vgpr_workitem_x_value: u32 = compute_pgm_rsrc2_user8_vgpr_workitem_x_value | 0x80;
 
 fn supportsEmbeddedGfx12Kernels(hw_ip: kmd.DrmAmdgpuInfoHwIp) bool {
     return hw_ip.hw_ip_version_major == 12;
@@ -226,6 +227,7 @@ const shader_offset_dmmv_q4_0_argmax_row_range: usize = 0x700;
 const shader_offset_dmmv_q4_0_row_range_parallel: usize = 0x900;
 const shader_offset_dmmv_q8_0_row_range_parallel: usize = 0xb00;
 const shader_offset_dmmv_q4_0_row_partial64: usize = 0xd00;
+const shader_offset_dmmv_q4_0_row_range_parallel_tgid: usize = 0xe00;
 const shader_page_bytes: usize = 4096;
 
 // gfx1201 one-wave kernel assembled with:
@@ -620,6 +622,86 @@ const dmmv_q4_0_row_range_parallel_gfx1201 = [_]u32{
     0xbfb00000,
 };
 
+// gfx1201 wave64 Q4_0 DMMV row-range kernel using workgroup-id-x for 64-row chunks.
+//
+// ABI:
+//   s[0:1] = input f32 vector pointer
+//   s[2:3] = output f32 row-result pointer
+//   s[4:5] = Q4_0 weight rows pointer
+//   s6     = cols, multiple of 32
+//   s7     = rows, multiple of 64
+//   s8     = workgroup_id_x
+//   v0     = workitem_id_x, row within the 64-row chunk
+//
+// This is the multi-workgroup companion to `dmmv_q4_0_row_range_parallel_gfx1201`:
+// one dispatch covers N adjacent 64-row chunks instead of emitting N PM4
+// DISPATCH_DIRECT packets into the same CS IB.
+const dmmv_q4_0_row_range_parallel_tgid_gfx1201 = [_]u32{
+    0x7e100300,
+    0x84098608,
+    0x4a101009,
+    0x7e020280,
+    0x850a8506,
+    0x1612100a,
+    0x16121292,
+    0xbe8b0080,
+    0xbf090a0b,
+    0xbfa2002d,
+    0x960d920b,
+    0x4a14120d,
+    0xee048004,
+    0x00000002,
+    0x0000000a,
+    0x960ea00b,
+    0xbe8f0080,
+    0xbf8903f7,
+    0x7e041702,
+    0xbf09900f,
+    0xbfa20020,
+    0x8010820d,
+    0x80100f10,
+    0x4a161210,
+    0xee040004,
+    0x00000003,
+    0x0000000b,
+    0x80110f0e,
+    0x84118211,
+    0x7e180211,
+    0xee050000,
+    0x00000006,
+    0x0000000c,
+    0x80120f0e,
+    0x80129012,
+    0x84128212,
+    0x7e1a0212,
+    0xee050000,
+    0x00000007,
+    0x0000000d,
+    0xbf8903f7,
+    0x3608068f,
+    0x320a0684,
+    0x4a0808c8,
+    0x4a0a0ac8,
+    0x7e080b04,
+    0x7e0a0b05,
+    0x10080902,
+    0x56020d04,
+    0x100a0b02,
+    0x56020f05,
+    0x800f810f,
+    0xbfa0ffde,
+    0x800b810b,
+    0xbfa0ffd1,
+    0x301c1082,
+    0xee068002,
+    0x00800000,
+    0x0000000e,
+    0xbfa00000,
+    0xbf800000,
+    0xbfb60003,
+    0xbfb00000,
+};
+
 // gfx1201 wave64 Q8_0 DMMV row-range kernel assembled with:
 //   llvm-mc-20 -triple=amdgcn-amd-amdhsa -mcpu=gfx1201 -filetype=obj
 //
@@ -831,7 +913,8 @@ comptime {
     std.debug.assert(shader_offset_dmmv_q4_0_argmax_row_range + dmmv_q4_0_argmax_row_range_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_row_range_parallel);
     std.debug.assert(shader_offset_dmmv_q4_0_row_range_parallel + dmmv_q4_0_row_range_parallel_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q8_0_row_range_parallel);
     std.debug.assert(shader_offset_dmmv_q8_0_row_range_parallel + dmmv_q8_0_row_range_parallel_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_row_partial64);
-    std.debug.assert(shader_offset_dmmv_q4_0_row_partial64 + dmmv_q4_0_row_partial64_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
+    std.debug.assert(shader_offset_dmmv_q4_0_row_partial64 + dmmv_q4_0_row_partial64_gfx1201.len * @sizeOf(u32) <= shader_offset_dmmv_q4_0_row_range_parallel_tgid);
+    std.debug.assert(shader_offset_dmmv_q4_0_row_range_parallel_tgid + dmmv_q4_0_row_range_parallel_tgid_gfx1201.len * @sizeOf(u32) <= shader_page_bytes);
 }
 
 /// Result produced by the ordered-score argmax row-range kernel.
@@ -1067,6 +1150,7 @@ pub const TokenBoundary = struct {
         for (dmmv_q4_0_row_range_parallel_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_row_range_parallel / @sizeOf(u32) + i] = word;
         for (dmmv_q8_0_row_range_parallel_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q8_0_row_range_parallel / @sizeOf(u32) + i] = word;
         for (dmmv_q4_0_row_partial64_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_row_partial64 / @sizeOf(u32) + i] = word;
+        for (dmmv_q4_0_row_range_parallel_tgid_gfx1201, 0..) |word, i| shader_words[shader_offset_dmmv_q4_0_row_range_parallel_tgid / @sizeOf(u32) + i] = word;
         storeFence();
 
         var bo_entries = [_]DrmAmdgpuBoListEntry{
@@ -2228,13 +2312,20 @@ pub const TokenBoundary = struct {
         self.builder.reset();
         try self.builder.writeNop(1);
 
-        const pgm_va = self.shader_va + shader_offset_dmmv_q4_0_row_range_parallel;
+        const use_tgid_chunks = rows > 64;
+        const pgm_va = self.shader_va + if (use_tgid_chunks)
+            shader_offset_dmmv_q4_0_row_range_parallel_tgid
+        else
+            shader_offset_dmmv_q4_0_row_range_parallel;
         const pgm_lo: u32 = @truncate(pgm_va >> 8);
         const pgm_hi: u32 = @truncate(pgm_va >> 40);
         try self.builder.setShReg(packet.sh_reg_pgm_lo, &[_]u32{ pgm_lo, pgm_hi });
         try self.builder.setShReg(packet.sh_reg_pgm_rsrc1, &[_]u32{
             compute_pgm_rsrc1_vgpr16_value,
-            compute_pgm_rsrc2_user8_vgpr_workitem_x_value,
+            if (use_tgid_chunks)
+                compute_pgm_rsrc2_user8_tgid_x_vgpr_workitem_x_value
+            else
+                compute_pgm_rsrc2_user8_vgpr_workitem_x_value,
         });
         try self.builder.setShRegOne(packet.sh_reg_pgm_rsrc3, 0);
         try self.builder.setShReg(packet.sh_reg_num_thread_x, &[_]u32{ 64, 1, 1 });
@@ -2246,21 +2337,35 @@ pub const TokenBoundary = struct {
 
         const in_lo: u32 = @truncate(self.input_va);
         const in_hi: u32 = @truncate(self.input_va >> 32);
-        var row_start: u32 = 0;
-        while (row_start < rows) : (row_start += 64) {
-            const out_va = self.output_va + @as(u64, row_start) * @sizeOf(f32);
-            const chunk_weight_va = weight_va + @as(u64, row_start) * @as(u64, row_bytes);
+        if (use_tgid_chunks) {
             try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
                 in_lo,
                 in_hi,
-                @truncate(out_va),
-                @truncate(out_va >> 32),
-                @truncate(chunk_weight_va),
-                @truncate(chunk_weight_va >> 32),
+                @truncate(self.output_va),
+                @truncate(self.output_va >> 32),
+                @truncate(weight_va),
+                @truncate(weight_va >> 32),
                 cols,
-                64,
+                rows,
             });
-            try self.builder.dispatchDirectInitiator(1, 1, 1, packet.dispatch_initiator_compute);
+            try self.builder.dispatchDirectInitiator(rows / 64, 1, 1, packet.dispatch_initiator_compute);
+        } else {
+            var row_start: u32 = 0;
+            while (row_start < rows) : (row_start += 64) {
+                const out_va = self.output_va + @as(u64, row_start) * @sizeOf(f32);
+                const chunk_weight_va = weight_va + @as(u64, row_start) * @as(u64, row_bytes);
+                try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
+                    in_lo,
+                    in_hi,
+                    @truncate(out_va),
+                    @truncate(out_va >> 32),
+                    @truncate(chunk_weight_va),
+                    @truncate(chunk_weight_va >> 32),
+                    cols,
+                    64,
+                });
+                try self.builder.dispatchDirectInitiator(1, 1, 1, packet.dispatch_initiator_compute);
+            }
         }
         try self.builder.releaseMemSignal(self.signal_va, signal_expected);
         try self.builder.padToAlignment(64);
@@ -2317,7 +2422,6 @@ pub const TokenBoundary = struct {
         var input_offsets: [max_batches]usize = undefined;
         var weight_offsets: [max_batches]usize = undefined;
         var row_offsets: [max_batches]u32 = undefined;
-        var row_bytes_list: [max_batches]usize = undefined;
         var cursor: usize = 0;
         var total_rows: u32 = 0;
 
@@ -2343,7 +2447,6 @@ pub const TokenBoundary = struct {
             input_offsets[i] = input_off;
             weight_offsets[i] = weight_off;
             row_offsets[i] = total_rows;
-            row_bytes_list[i] = row_bytes;
             total_rows += batch.rows;
         }
 
@@ -2362,13 +2465,13 @@ pub const TokenBoundary = struct {
         self.builder.reset();
         try self.builder.writeNop(1);
 
-        const pgm_va = self.shader_va + shader_offset_dmmv_q4_0_row_range_parallel;
+        const pgm_va = self.shader_va + shader_offset_dmmv_q4_0_row_range_parallel_tgid;
         const pgm_lo: u32 = @truncate(pgm_va >> 8);
         const pgm_hi: u32 = @truncate(pgm_va >> 40);
         try self.builder.setShReg(packet.sh_reg_pgm_lo, &[_]u32{ pgm_lo, pgm_hi });
         try self.builder.setShReg(packet.sh_reg_pgm_rsrc1, &[_]u32{
             compute_pgm_rsrc1_vgpr16_value,
-            compute_pgm_rsrc2_user8_vgpr_workitem_x_value,
+            compute_pgm_rsrc2_user8_tgid_x_vgpr_workitem_x_value,
         });
         try self.builder.setShRegOne(packet.sh_reg_pgm_rsrc3, 0);
         try self.builder.setShReg(packet.sh_reg_num_thread_x, &[_]u32{ 64, 1, 1 });
@@ -2383,23 +2486,18 @@ pub const TokenBoundary = struct {
             const in_lo: u32 = @truncate(in_va);
             const in_hi: u32 = @truncate(in_va >> 32);
             const weight_va = self.input_va + @as(u64, weight_offsets[batch_i]);
-            var row_start: u32 = 0;
-            while (row_start < batch.rows) : (row_start += 64) {
-                const out_row = row_offsets[batch_i] + row_start;
-                const out_va = self.output_va + @as(u64, out_row) * @sizeOf(f32);
-                const chunk_weight_va = weight_va + @as(u64, row_start) * @as(u64, row_bytes_list[batch_i]);
-                try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
-                    in_lo,
-                    in_hi,
-                    @truncate(out_va),
-                    @truncate(out_va >> 32),
-                    @truncate(chunk_weight_va),
-                    @truncate(chunk_weight_va >> 32),
-                    batch.cols,
-                    64,
-                });
-                try self.builder.dispatchDirectInitiator(1, 1, 1, packet.dispatch_initiator_compute);
-            }
+            const out_va = self.output_va + @as(u64, row_offsets[batch_i]) * @sizeOf(f32);
+            try self.builder.setShReg(packet.compute_user_data_0, &[_]u32{
+                in_lo,
+                in_hi,
+                @truncate(out_va),
+                @truncate(out_va >> 32),
+                @truncate(weight_va),
+                @truncate(weight_va >> 32),
+                batch.cols,
+                batch.rows,
+            });
+            try self.builder.dispatchDirectInitiator(batch.rows / 64, 1, 1, packet.dispatch_initiator_compute);
         }
         try self.builder.releaseMemSignal(self.signal_va, signal_expected);
         try self.builder.padToAlignment(64);
