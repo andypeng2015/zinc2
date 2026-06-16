@@ -33,7 +33,7 @@ The gap is **kernel efficiency**, not architecture: llama runs MMQ-class fused-d
 
 ## Validation contract (every cycle)
 - Build with ISOLATED caches (`ZIG_LOCAL_CACHE_DIR`+`ZIG_GLOBAL_CACHE_DIR`); verify the binary md5 actually changed or you measured stale code.
-- **Token-correct:** `scripts/validate_catalog.sh` (`ZINC_GPU`=5090 UUID) stays 5/5 (bit-identical for T1b; token-correctness-tolerance for T1a/T2/T3 reduction-order changes). A divergence = bug → fix or revert.
+- **Token-correct — FAST per-cycle gate (do NOT run the full catalog every cycle: `validate_catalog.sh` REBUILDS cuda-dbg + loads all 5 ~17 GB models = ~68 min/cycle, far too slow).** Per cycle: build cuda-dbg ONCE, then a 1-MODEL spot-check (qwen35-9b via `dbg_cuda gen`/`batch`, ~3 min) to confirm the kernel didn't break correctness + the A/B. Run the FULL `scripts/validate_catalog.sh` (5/5, `ZINC_GPU`=5090 UUID; bit-identical for T1b, token-correctness-tolerance for T1a/T2/T3) ONLY in the cycle where you COMMIT a win — the final pre-commit gate. A divergence = bug → fix or revert. This keeps cycles ~15 min, not ~68.
 - **Perf A/B:** interleaved (ABBA) new-kernel vs prior-base ZINC, util-gated (skip CONTENDED rounds — the 5090 is shared with Effort-27 which leaks; `--query-gpu=utilization.gpu`, a foreign-compute round is GARBAGE). Take medians; a "win" must robustly clear the ±~10% boost floor.
 - **The BAR is llama:** on a real win, also A/B vs `~/workspace/llama.cpp/build/bin/llama-bench` on the SAME 5090 + same gguf (pp256/tg128) to track gap-closure. Don't trust a single boost-noisy number.
 
@@ -46,7 +46,7 @@ The gap is **kernel efficiency**, not architecture: llama runs MMQ-class fused-d
 ## CURRENT STATE (read FIRST; update LAST every cycle)
 **In progress:** nothing yet — week just spawned (branch = origin/main `b6494ebf` + this effort file + driver + watchdog).
 **Exact next step:** START **T1b (persistent fp16 weight cache)** — the simplest clearly-real prefill win. Locate the per-GEMM `dequant_q4k_to_f16`→scratch→`cuda_cublas_hgemm` path in `forward_cuda_gemma.zig` (`gemmDispatch`/`gemmDispatchPrefill`), add a one-time-per-model fp16 dequant cache for the dense weights, point prefill GEMMs at it, A/B pp256/512 vs the per-GEMM path, catalog 5/5.
-**Open risks/notes:** the 5090 is shared with Effort-27 (4090) which leaks foreign compute onto the 5090 → util-gate every A/B round (skip CONTENDED). If contention blocks progress for many cycles, log it (a human may pin/pause e27).
+**Open risks/notes:** (1) 5090 shared with Effort-27 (4090) which leaks foreign compute onto idx0 → util-gate every A/B (skip CONTENDED); if it blocks progress for many cycles, log it. (2) **USE THE FAST PER-CYCLE GATE** (1-model spot-check; full `validate_catalog.sh` only in the commit cycle) — full catalog is ~68 min/cycle (rebuild + 5 model loads), far too slow to run every cycle. (3) wrapped in `loop_watchdog_e29.sh` (self-recovery, 90-min stale threshold, auto-restart on exit/hang) — **commit+push your win PROMPTLY** so a restart can't discard it (uncommitted work is reset to origin/perf/e29-cuda-kernels on restart). (4) 2026-06-15: cycle-1 began T1b (fp16 weight cache) and it passed catalog 5/5 once but wasn't committed before a watchdog/setup reset — re-do T1b (it's correctness-confirmed), commit it fast.
 
 ## Cycle log
 (append per cycle: cycle | lever | change | built+md5? | catalog 5/5? | A/B (ZINC new vs base, util-gated) [+ vs llama] | branch/sha or revert+why | next)
